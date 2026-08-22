@@ -24,16 +24,59 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 Implemented endpoints are `GET /v1/models`, `GET /v1/models/{model}`,
 `POST /v1/chat/completions`, and legacy `POST /v1/completions`. Chat and
 completion requests support JSON responses, SSE streaming, usage counts,
-`max_tokens`/`max_completion_tokens`, `temperature`, and `top_p`. The extension
+`max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, and up to four
+custom `stop` sequences. Stop sequences are removed from the response and end
+generation early in both JSON and streaming modes. The extension
+`x_colibri_ignore_leading_stop: true` discards leading stop sequences until
+the first non-whitespace response content, which is useful for local templates
+that occasionally emit a role marker before the answer; strict OpenAI stop
+behavior remains the default for client-provided sequences. GLM chat requests
+with no client `stop` automatically use the template's `<|user|>` and
+`<|observation|>` role markers, patiently ignoring only leading markers; this
+prevents a model-completed turn from silently generating a new user or tool
+turn. Inkling chat and legacy completion requests receive no implicit GLM stop
+sequences. The extension
 `enable_thinking: true` enables GLM-5.2's reasoning block; the standard
 `reasoning_effort` field also enables it unless set to `none`.
 
-The server is deliberately text-only and serves one generation at a time: the
-744B model stays in one persistent process, so concurrent HTTP requests queue
-instead of loading duplicate model copies. Tools, image/audio input, custom
-stop sequences, log probabilities, and token penalties return an explicit error
-rather than being silently ignored. The default bind address is localhost; set
-`COLI_API_KEY` before exposing the server beyond the machine.
+The server serves one generation at a time: the model stays in one persistent
+process, so concurrent HTTP requests queue instead of loading duplicate model
+copies. Tool calling depends on the active engine; see the support matrix below.
+Images, log probabilities, and token penalties return an explicit error rather
+than being silently ignored. Audio is accepted only by Inkling checkpoints with
+audio support. The default bind address is localhost; set `COLI_API_KEY` before
+exposing the server beyond the machine.
+
+### Tool-calling support
+
+| Engine | OpenAI `tools` | Anthropic `tool_use` | Native format |
+|---|---|---|---|
+| GLM-5.2 (`colibri`) | yes | yes | `<tool_call>` blocks |
+| DeepSeek V4 | yes | yes | native DSML tool-call blocks |
+| Inkling | no | no | active tool declarations/choices return HTTP 400 |
+| Kimi K3 | no | no | active tool declarations/choices return HTTP 400 |
+| OLMoE | no | no | active tool declarations/choices return HTTP 400 |
+
+On supported engines, pass OpenAI `tools` and optionally `tool_choice` to
+`/v1/chat/completions`. The Anthropic endpoint translates `tools`,
+`tool_use`/`tool_result`, and the `auto`, `any`, `none`, and forced-tool choice
+modes into the active engine's native prompt and back into protocol responses.
+Protocol support does not guarantee that every quantized model emits valid
+tool syntax; `COLI_TOOL_SALVAGE=1` is an opt-in recovery path for malformed GLM
+int4 tool calls. DeepSeek V4 uses its strict native DSML parser instead.
+
+When a reverse proxy or MagicDNS hostname preserves a public `Host` header,
+trust that exact hostname with repeatable `--allowed-host` options. The
+comma-separated `COLI_ALLOWED_HOSTS` environment variable is equivalent:
+
+```bash
+COLI_ALLOWED_HOSTS=llm.example.com ./coli serve --model /nvme/glm52_i4
+# or: ./coli serve --model /nvme/glm52_i4 --allowed-host llm.example.com
+```
+
+Only configure hostnames or IP addresses you control; there is no wildcard.
+This setting extends the DNS-rebinding allowlist and is independent of CORS and
+API-key authentication.
 
 Browser access from the Vite development server and Tauri local origins is
 enabled by default. Repeat `--cors-origin https://your-ui.example` to allow
@@ -72,18 +115,26 @@ export ANTHROPIC_MODEL=glm-5.2-colibri
 claude
 ```
 
-Supported: system prompts (string or text blocks), multi-turn `user`/`assistant`
-messages, `text` / `tool_use` / `tool_result` content blocks, tools with
-`input_schema`, every `tool_choice` mode, streaming with the full named-event
+Supported on every served architecture: system prompts (string or text blocks),
+multi-turn `user`/`assistant` messages, streaming with the full named-event
 sequence (`message_start` → `content_block_*` → `message_delta` → `message_stop`,
-plus protocol `ping` keepalives during long prefills), `stop_reason`
-(`end_turn` / `max_tokens` / `tool_use`), Anthropic `usage` field names, and
-`x-api-key` authentication (`Authorization: Bearer` also works). Extended
-thinking is enabled with `{"thinking": {"type": "enabled"}}`.
+plus protocol `ping` keepalives during long prefills), `stop_reason`, Anthropic
+`usage` field names, and `x-api-key` authentication (`Authorization: Bearer`
+also works). The gateway renders each request with the active engine's native
+chat template; GLM, Inkling, Kimi K3, OLMoE, and DeepSeek V4 prompts are not
+interchangeable. Where the engine exposes a reasoning mode, extended thinking
+is enabled with `{"thinking": {"type": "enabled"}}` and translated to that
+architecture's reasoning protocol; OLMoE disables it explicitly.
+
+Tool use follows the per-engine matrix above. Unsupported engines reject active
+tool declarations and choices explicitly instead of feeding another
+architecture's markers to an incompatible tokenizer.
 
 Not supported, and refused explicitly rather than ignored: `stop_sequences`,
 `top_k`, and non-text content blocks (images, documents). Errors use Anthropic's
-own `{"type":"error","error":{...}}` envelope on this path.
+own `{"type":"error","error":{...}}` envelope on this path. Architecture-local
+features that have not been wired to this protocol are likewise rejected with
+an explicit error.
 
 > The prefill warning below applies here too, and applies *hardest* to Claude Code:
 > its system prompt and tool catalog are large, and on a disk-streaming CPU path
@@ -195,6 +246,11 @@ same port, then opens your browser when the engine is ready:
 cd web && npm install && npm run build   # once
 ./coli web --model <model-dir>
 ```
+
+`coli web` differs from `coli serve` only in opening a browser — both serve the
+dashboard on the same port. On a headless host (no display, often no GPU at all)
+use `coli serve`, or `coli web --no-browser`, and point a browser at it from
+another machine. Nothing in the dashboard needs a desktop session on the host.
 
 What you get:
 

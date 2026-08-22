@@ -5,6 +5,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "tok.h"
 
@@ -97,7 +98,39 @@ static int dist_sample(int V, int ban){
 /* next token from logits: greedy if g_temp<=0, sampling otherwise.
  * ban = token excluded because it was rejected by speculative verification. */
 static int pick_tok(const float *lo, int V, int ban){
-    if (g_temp <= 0) return argmax_v(lo, V);
+    /* COLI_LOGIT_DUMP=1: top-5 (id:logit) per step to stderr — for comparing two
+     * engine configs on identical forced context (backend-exactness triage). */
+    static int dump = -1;
+    if (dump < 0) dump = getenv("COLI_LOGIT_DUMP") ? 1 : 0;
+    if (dump){
+        int id[5]={-1,-1,-1,-1,-1}; float v[5]={-3e38f,-3e38f,-3e38f,-3e38f,-3e38f};
+        for (int t = 0; t < V; t++){
+            float x = lo[t];
+            for (int k = 0; k < 5; k++) if (x > v[k]){
+                for (int j = 4; j > k; j--){ v[j]=v[j-1]; id[j]=id[j-1]; }
+                v[k]=x; id[k]=t; break;
+            }
+        }
+        fprintf(stderr,"[LOGITS]");
+        for (int k = 0; k < 5; k++) fprintf(stderr," %d:%.6f", id[k], v[k]);
+        fprintf(stderr,"\n");
+    }
+    if (g_temp <= 0) {
+        int a = argmax_v(lo, V);
+        /* COLI_LOGIT_GAP=1: probe-only dump of the top-2 logits at each greedy
+         * pick, to tell a near-tie (float accumulation order) apart from a real
+         * divergence. Read-only: the token returned is unchanged. */
+        static int gap_dbg = -1; static int gap_pos = 0;
+        if (gap_dbg < 0) { const char *e = getenv("COLI_LOGIT_GAP"); gap_dbg = (e && *e && *e != '0'); }
+        if (gap_dbg) {
+            int b = -1; float bv = -INFINITY;
+            for (int i = 0; i < V; i++) { float x = lo[i]; if (i != a && x == x && x > bv) { bv = x; b = i; } }
+            double t1 = (double)lo[a], t2 = (b >= 0) ? (double)bv : 0.0;
+            fprintf(stderr, "LOGITGAP pos=%d top1=%d:%.6f top2=%d:%.6f gap=%.9f\n",
+                    gap_pos++, a, t1, b, t2, (b >= 0) ? t1 - t2 : 0.0);
+        }
+        return a;
+    }
     dist_build(lo, V);
     return dist_sample(V, ban);
 }
@@ -116,14 +149,23 @@ static void stops_arm_tok(const Cfg *c, int tok_eos, Tok *T){
     int nsp = 0;
     if (T) for (int id = 0; id < T->n_ids && g_nstop < 64; id++)
         if (T->id_special[id] && !is_stop(id)) { g_stop[g_nstop++] = id; nsp++; }
-    /* #401: in serve mode keep ONLY <|endoftext|>. Role markers <|user|>/<|observation|>
-     * (config stops + tokenizer special set) are boundaries the Python server owns; as
-     * hard stops they cut generation the moment the model opens a <tool_call> block,
-     * because int4 argmax noise picks a stop-token ID over the correct '<' token. */
-    if (getenv("SERVE") && tok_eos >= 0) {
+    /* #401: in batched gateway mode keep ONLY <|endoftext|>. Role markers
+     * <|user|>/<|observation|> (config stops + tokenizer special set) are boundaries
+     * the Python server owns; as hard stops they cut generation the moment the model
+     * opens a <tool_call> block, because int4 argmax noise picks a stop-token ID over
+     * the correct '<' token. Private `coli chat` also sets SERVE=1 for the byte
+     * protocol, but has no Python StopFilter, so it must retain the full stop set.
+     *
+     * #549: on some quantized containers (notably int4-gs64) an end-of-turn special
+     * OTHER than <|endoftext|> wins the final-token margin, so serve mode never stops and
+     * runs into hallucinated turns. COLI_SERVE_ALL_STOPS=1 re-arms the full stop set for
+     * users who are NOT doing tool calls (or whose client owns the tool boundary), at the
+     * cost of the #401 tool-call safety. Default off — filter unchanged. */
+    if (getenv("SERVE") && getenv("SERVE_BATCH") && atoi(getenv("SERVE_BATCH")) &&
+        tok_eos >= 0 && !getenv("COLI_SERVE_ALL_STOPS")) {
         int kept = 0;
         for (int i = 0; i < g_nstop; i++) if (g_stop[i] == tok_eos) g_stop[kept++] = g_stop[i];
-        if (kept < g_nstop) fprintf(stderr, "[stop] serve mode: filtered %d non-EOS stop tokens (tool-call safety, #401)\n", g_nstop - kept);
+        if (kept < g_nstop) fprintf(stderr, "[stop] batched serve mode: filtered %d non-EOS stop tokens (tool-call safety, #401)\n", g_nstop - kept);
         g_nstop = kept; nsp = 0;
     }
     fprintf(stderr, "[stop] %d stop tokens:", g_nstop);

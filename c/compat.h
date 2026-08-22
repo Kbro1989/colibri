@@ -1,10 +1,24 @@
 /* compat.h — shim di portabilita' per piattaforme non-Linux (oggi: macOS / Apple Silicon,
  * Windows 11 x86-64 via MinGW-w64).
- * Su Linux questo header e' un NO-OP totale: nessun simbolo definito o ridefinito,
- * zero impatto sul percorso x86 esistente.
- * Regola: ogni differenza di piattaforma vive QUI; i .c restano puliti. */
+ * Regola: ogni differenza di piattaforma vive QUI; i .c restano puliti.
+ *
+ * Storicamente su Linux questo header era un NO-OP totale (solo shim per le altre
+ * piattaforme). Non lo e' piu': coli_stdin_readable() definisce anche il ramo POSIX,
+ * perche' un helper *portabile* deve esistere su tutte le piattaforme -- altrimenti i
+ * .c dovrebbero avere il proprio #ifdef, che e' esattamente cio' che la regola vieta.
+ * Resta vero che il percorso Linux non e' alterato: nulla viene ridefinito, e la
+ * funzione e' static inline, quindi un TU che non la chiama non paga nulla. */
 #ifndef COMPAT_H
 #define COMPAT_H
+
+#include <errno.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #ifdef __APPLE__
 #include <fcntl.h>
@@ -95,6 +109,7 @@ static inline int compat_open_direct(const char *path){
  * is defense-in-depth: if anyone adds a future CRT-based read path, O_BINARY
  * prevents 0x0A bytes from being silently translated to \r\n. */
 #define COMPAT_O_RDONLY (O_RDONLY | O_BINARY)
+#define COMPAT_O_BINARY O_BINARY
 
 /* --- posix_fadvise: Windows has no direct equivalent. Semantics:
  *      WILLNEED  -> warm the OS page cache so a later synchronous pread finds the
@@ -314,6 +329,12 @@ static inline int compat_setenv(const char *name, const char *value, int overwri
 }
 #define setenv(name,value,overwrite) compat_setenv(name,value,overwrite)
 
+/* --- unsetenv -> SetEnvironmentVariableA(NULL) --- */
+static inline int compat_unsetenv(const char *name){
+    return SetEnvironmentVariableA(name, NULL) ? 0 : -1;
+}
+#define unsetenv(name) compat_unsetenv(name)
+
 /* --- getenv_utf8: read an env var as UTF-8, not through the ANSI codepage ---
  * Plain getenv()/_environ are populated by the CRT from the ANSI-codepage view
  * of the process environment block, not UTF-8. A parent that hands the child a
@@ -370,5 +391,150 @@ static inline char *compat_mkdtemp(char *tmpl){
 #ifndef COMPAT_O_RDONLY
 #define COMPAT_O_RDONLY O_RDONLY
 #endif
+#ifndef COMPAT_O_BINARY
+#define COMPAT_O_BINARY 0
+#endif
+
+/* --- read-only file mapping -------------------------------------------------
+ * A small ownership-carrying primitive for safetensors that are already in the
+ * engine's final byte representation.  The caller gets a pointer to the exact
+ * requested (possibly unaligned) range while this object retains the aligned
+ * OS view needed to release it safely.
+ *
+ * This does not prefetch or lock pages.  Mapping changes ownership/accounting,
+ * not the model's active working set: pages are faulted when the caller reads
+ * them and remain reclaimable file-backed cache pages. */
+typedef struct {
+    void *base;
+    size_t len;
+#ifdef _WIN32
+    HANDLE mapping;
+#endif
+} compat_ro_map;
+
+static inline int compat_map_readonly(int fd, int64_t off, size_t len,
+                                      compat_ro_map *map, const void **data)
+{
+    if (!map || !data || off < 0 || len == 0) { errno = EINVAL; return -1; }
+    memset(map, 0, sizeof(*map));
+#ifdef _WIN32
+    intptr_t osfh = _get_osfhandle(fd);
+    if (osfh == -1 || osfh == -2) { errno = EBADF; return -1; }
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    uint64_t gran = si.dwAllocationGranularity ? si.dwAllocationGranularity : 65536u;
+    uint64_t aligned = (uint64_t)off - ((uint64_t)off % gran);
+    uint64_t delta = (uint64_t)off - aligned;
+    if (delta > SIZE_MAX || len > SIZE_MAX - (size_t)delta) { errno = EOVERFLOW; return -1; }
+    size_t view_len = (size_t)delta + len;
+    HANDLE fm = CreateFileMappingA((HANDLE)osfh, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!fm) { errno = EIO; return -1; }
+    void *base = MapViewOfFile(fm, FILE_MAP_READ,
+                               (DWORD)(aligned >> 32), (DWORD)(aligned & 0xffffffffu),
+                               view_len);
+    if (!base) { CloseHandle(fm); errno = EIO; return -1; }
+    map->base = base;
+    map->len = view_len;
+    map->mapping = fm;
+    *data = (const char*)base + (size_t)delta;
+#else
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) pg = 4096;
+    uint64_t gran = (uint64_t)pg;
+    uint64_t aligned = (uint64_t)off - ((uint64_t)off % gran);
+    uint64_t delta = (uint64_t)off - aligned;
+    if (delta > SIZE_MAX || len > SIZE_MAX - (size_t)delta) { errno = EOVERFLOW; return -1; }
+    size_t view_len = (size_t)delta + len;
+    void *base = mmap(NULL, view_len, PROT_READ, MAP_SHARED, fd, (off_t)aligned);
+    if (base == MAP_FAILED) return -1;
+    map->base = base;
+    map->len = view_len;
+    *data = (const char*)base + (size_t)delta;
+#endif
+    return 0;
+}
+
+static inline void compat_unmap_readonly(compat_ro_map *map)
+{
+    if (!map || !map->base) return;
+#ifdef _WIN32
+    UnmapViewOfFile(map->base);
+    if (map->mapping) CloseHandle(map->mapping);
+#else
+    munmap(map->base, map->len);
+#endif
+    memset(map, 0, sizeof(*map));
+}
+
+/* --- coli_stdin_readable: "c'e' input su stdin adesso?", senza bloccare ---
+ *
+ * I serve loop di inkling.c e kimi_k3.c usavano select() su fd_set direttamente.
+ * Su Windows quei simboli non esistono in quella forma e le due build FALLIVANO
+ * (misurato: Linux ok, macOS ok, Windows/UCRT64 no) -- ed e' il motivo per cui
+ * le release binarie hanno sempre contenuto il solo motore GLM.
+ *
+ * La logica Windows non e' una traduzione meccanica: ha assorbito due bug.
+ *   #139  select() su un handle di pipe finisce in winsock e ritorna sempre
+ *         SOCKET_ERROR, quindi il loop non accettava mai una richiesta.
+ *   #195  le pipe anonime NON sono oggetti attendibili: WaitForSingleObject su
+ *         di esse e' undefined, e PeekNamedPipe fallisce su handle di file o
+ *         console. Su stdin non-pipe si riporta "niente da leggere" invece di
+ *         bloccare il loop.
+ * Duplicarla una terza volta avrebbe rifatto entrare quei due bug in due motori
+ * dove nessuno li avrebbe cercati: sta qui una volta sola.
+ *
+ * static inline: e' un header condiviso, e un TU che non la usa non deve pagarla. */
+#ifndef _WIN32
+#include <sys/select.h>   /* select(), fd_set, struct timeval */
+#endif
+
+#ifdef _WIN32
+static inline int coli_stdin_readable(void)
+{
+    HANDLE ih = (HANDLE)_get_osfhandle(_fileno(stdin));
+    DWORD avail = 0;
+    if (ih == INVALID_HANDLE_VALUE) return 0;
+    if (PeekNamedPipe(ih, NULL, 0, NULL, &avail, NULL)) return avail > 0;
+    return 0;   /* console/file: nessun poll non bloccante, meglio "niente" che bloccare */
+}
+#else
+static inline int coli_stdin_readable(void)
+{
+    /* fd 0 letterale, non STDIN_FILENO: quella macro vive in <unistd.h>, che questo
+     * header non include su tutte le piattaforme, e stdin e' 0 ovunque per POSIX. */
+    fd_set r; struct timeval tv = {0, 0};
+    FD_ZERO(&r); FD_SET(0, &r);
+    return select(1, &r, NULL, NULL, &tv) > 0 && FD_ISSET(0, &r);
+}
+#endif
+
+/* --- coli_serve_binary_mode: stdin/stdout in BINARY per il protocollo di serve ---
+ *
+ * I motori parlano un protocollo a BYTE con `coli`:
+ *   stdout  \x01\x01READY\x01\x01\n, righe STAT, \x01\x01END\x01\x01\n
+ *   stdin   righe di testo piu' i byte di controllo \x02RESET / \x02MORE
+ * Il gateway confronta i sentinella con endswith() e una regex "^STAT ...", quindi
+ * devono arrivare ESATTI (LF, senza CR).
+ *
+ * Su Windows il CRT apre entrambi gli handle in modalita' TEXT: stdout traduce
+ * '\n' -> '\r\n' (il sentinella READY non combacia MAI e la chat si blocca senza
+ * errore), e stdin traduce '\r\n' -> '\n' e rifiuta la scrittura di byte grezzi con
+ * EINVAL, rompendo il protocollo di controllo. (#195)
+ *
+ * colibri.c lo fa da sempre; inkling.c e kimi_k3.c sono nati senza, e nessuno se n'e'
+ * accorto finche' le release binarie non hanno iniziato a contenere quei motori
+ * (#720 -> #748: Kimi K3 su Windows caricava 93 layer in 42 minuti e poi restava
+ * fermo per sempre, perche' il gateway aspettava un byte gia' storpiato).
+ * Sta QUI e non copiato in ogni motore: e' esattamente cosi' che era sparito.
+ *
+ * No-op su Linux/macOS. */
+static inline void coli_serve_binary_mode(void)
+{
+#ifdef _WIN32
+    _setmode(_fileno(stdin),  _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    setvbuf(stdout, NULL, _IONBF, 0);
+#endif
+}
 
 #endif /* COMPAT_H */

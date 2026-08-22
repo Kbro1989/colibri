@@ -3,7 +3,9 @@
  * token id del riferimento (ref.json) -> valida il core prima di scalare a GLM-5.2.
  *
  * Densa (embed, attn, router, norme, lm_head) residente in RAM (float32).
- * Expert letti dal disco on-demand via pread+fadvise(DONTNEED), cache LRU per-layer.
+ * Expert letti dal disco on-demand via pread, cache LRU per-layer; le pagine
+ * restano nel page cache cosi' i miss LRU non tornano su disco (EXPERT_DROP=1
+ * ripristina fadvise(DONTNEED) per macchine con poca RAM).
  * Matmul multi-thread con OpenMP (niente BLAS).
  *
  * ENV VARS:
@@ -13,6 +15,9 @@
  *   WIDE=N        : prefetch top-K*N candidates (default 1, try 2 or 3)
  *   SMOOTH=F      : EMA coefficient for routing momentum (default 0.3, range 0.0-0.95)
  *   CONF_LIMIT=F  : cumulative gate probability threshold for prefetch cutoff (default 0.92)
+ *   PILOT_EVICT_GUARD=0/1 : 1=enable LFRU prefetch eviction guard (default), 0=disable
+ *   EXPERT_DROP=0/1: 1=fadvise(DONTNEED) after each expert read (old behaviour,
+ *                    for RAM-tight boxes); 0=keep pages cached (default)
  *   (expert queue is sorted by eid for SSD read locality)
  */
 #define _GNU_SOURCE
@@ -27,6 +32,12 @@
 #include <unistd.h>
 #endif
 #include "st.h"
+#ifdef _OPENMP
+#include <omp.h>   /* omp_set_num_threads/omp_get_max_threads per omp_tune.h */
+#endif
+#include "omp_tune.h"
+#include "route_trace.h"                    /* shared routing telemetry (#700) */
+#include "serve_codec.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -42,6 +53,9 @@ typedef struct {
     int hidden, n_layers, n_heads, n_kv_heads, head_dim;
     int n_experts, topk, inter, vocab;
     float theta, eps; int norm_topk;
+    int stop_ids[8], n_stop;   /* unused (no model-specific hardcoded stops) — chat mode's
+                                 * stop set comes entirely from the tokenizer's own special-
+                                 * token flags via sample.h's stops_arm_tok */
 } Cfg;
 
 /* ---------- pesi densi per-layer ---------- */
@@ -70,7 +84,7 @@ typedef struct {
     float **K, **V; int kv_len, max_t;
     double dense_load_s;
     /* IMPROVEMENT 2: expert frequency heatmap */
-    uint32_t *freq;
+    uint32_t **freq;                   /* per-layer expert counts, owned by route_trace.h */
     int freq_token_count, hot_pinned, hot_n, warmup_tokens;
     int token_count;
     /* PREDICTION IMPROVEMENT A: per-layer EMA of gate logits across tokens.
@@ -82,6 +96,7 @@ typedef struct {
     uint8_t *is_pinned;     /* [n_layers * n_experts], 1 if expert is globally pinned */
     uint8_t *is_queued;     /* [n_layers * n_experts], 1 if expert is currently in the prefetch queue */
     float pilot_conf_limit; /* CONF_LIMIT env: cumulative gate probability threshold (e.g. 0.92) */
+    uint64_t *last_access;  /* [n_layers * n_experts], clock time when expert was last accessed */
 } Model;
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -90,6 +105,18 @@ static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
 static int g_pilot = 0;
 static int g_wide  = 1;  /* IMPROVEMENT 4: top-K * g_wide candidates prefetched */
+static int g_pilot_evict_guard = 1; /* PILOT_EVICT_GUARD=0 to disable LFRU prefetch eviction guard */
+static int g_expert_drop = 0;       /* EXPERT_DROP=1 restores fadvise(DONTNEED) after expert reads */
+static int g_fused3 = 0;            /* FUSED3=1: AVX2 activation quant + gate/up pair matmul
+                                     * (fused_simd.h: quant_x_q8_avx2, matmul_q_idot_v3,
+                                     * matmul_q_idot_pair_v3). Exact integer arithmetic only —
+                                     * bit-identical to the stock matmul_q path; OFF by default. */
+
+static uint64_t lfru_score(uint32_t heat, uint64_t last, uint64_t clock) {
+    uint64_t age = (clock > last) ? (clock - last) : 0;
+    uint64_t recent = (age < 255) ? (255 - age) : 0;
+    return ((uint64_t)heat << 8) | recent;
+}
 
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
 static void *pilot_worker(void *arg);
@@ -117,6 +144,14 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 #endif
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 
+/* chat mode only (main()'s CHAT=1 path): sampling temperature/top-p and the
+ * tokenizer + stop-set machinery. g_temp<=0 -> greedy (sample.h's pick_tok).
+ * Declared before #include "sample.h" — it references these by name, and
+ * Cfg/falloc above, without its own extern declarations. */
+static float g_temp = 0.7f;   /* TEMP env overrides */
+static float g_nuc  = 0.95f;  /* NUCLEUS env overrides */
+#include "sample.h"
+
 /* y[S,O] = x[S,I] @ W^T,  W e' [O,I] row-major */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
     #pragma omp parallel for schedule(static)
@@ -125,6 +160,7 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s * I;
             float acc = 0.f;
+            #pragma omp simd reduction(+:acc)
             for (int i = 0; i < I; i++) acc += xs[i] * w[i];
             y[(int64_t)s * O + o] = acc;
         }
@@ -135,7 +171,11 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
  * W[o,i] ~= q[o,i]*scale[o]  ->  y[o] = scale[o] * sum_i x[i]*q[o,i].
  * Su ARM: attivazione quantizzata Q8_0 (scala per blocco di 16) + dot int8
  * NEON (sdot dove c'e' dotprod) — stessa famiglia IDOT di glm.c, IDOT=0 per
- * la via scalare byte-esatta. Misurato 2.7x end-to-end su M5. */
+ * la via scalare byte-esatta. Misurato 2.7x end-to-end su M5.
+ *
+ * NB: la quantizzazione delle ATTIVAZIONI rende questo percorso non
+ * equivalente alla via scalare (issue #1044). Vale per NEON come per AVX2:
+ * IDOT e' opt-in (IDOT=1), non piu' attivo di default. */
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
@@ -149,11 +189,68 @@ static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
 #endif
     return vaddvq_s32(acc);
 }
+#define HAVE_FAST_DOT_I8 1
+#elif defined(__AVX2__)
+#include <immintrin.h>
+/* x86 counterpart of the NEON path above (was scalar-only here before —
+ * the only fast path was ARM, so x86 boxes silently used the scalar
+ * fallback even when AVX2 was available).
+ * Sign-extend both int8 vectors to int16 (exact, no precision loss) then
+ * madd+horizontal-sum in int32: pure integer arithmetic, so THIS DOT is
+ * bit-for-bit identical to a scalar int8 dot, just vectorized.
+ *
+ * That exactness does NOT extend to the branch that calls it. matmul_q's IDOT
+ * path quantizes the ACTIVATIONS to Q8_0 per 16-block before calling this,
+ * which the scalar fallback does not do -- so the two paths differ. This
+ * comment previously read as if it covered the whole path, which is how
+ * issue #1044 stayed invisible. See the note at the idot default below. */
+static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
+    __m256i va16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)a));
+    __m256i vb16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)b));
+    __m256i prod = _mm256_madd_epi16(va16, vb16);           /* 8 x int32, adjacent pairs summed */
+    __m128i sum128 = _mm_add_epi32(_mm256_castsi256_si128(prod), _mm256_extracti128_si256(prod, 1));
+    __m128i hi64   = _mm_unpackhi_epi64(sum128, sum128);
+    __m128i sum64  = _mm_add_epi32(sum128, hi64);
+    __m128i hi32   = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
+    __m128i sum32  = _mm_add_epi32(sum64, hi32);
+    return _mm_cvtsi128_si32(sum32);
+}
+#define HAVE_FAST_DOT_I8 1
 #endif
+/* Test-only hook, compiled out of the shipping binary.
+ *
+ * matmul_q reads IDOT once into a static, so a test cannot exercise both paths
+ * in one process without it. Guarded by OLMOE_TESTING so production builds have
+ * neither the global nor the branch: tests/test_olmoe_matmul_q.c defines it. */
+#ifdef OLMOE_TESTING
+int matmul_q_idot_force = -1;
+static inline void matmul_q_reset_for_test(void) { matmul_q_idot_force = -1; }
+#endif
+
+#if defined(__AVX2__)
+#include "fused_simd.h"   /* FUSED3=1: quant_x_q8_avx2 + matmul_q_idot{,_pair}_v3 (bit-exact) */
+#endif
+
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
-#if defined(__ARM_NEON)
+#if defined(HAVE_FAST_DOT_I8)
+    /* IDOT is OPT-IN. It quantizes the ACTIVATIONS to Q8_0 per 16-block (below),
+     * which the scalar fallback never does, so the two paths are not numerically
+     * equivalent: measured 5/12 vs 12/12 matching tokens against a reference
+     * (issue #1044). Before 2c4e9de x86 had no fast dot at all, so IDOT=1 fell
+     * through to the exact scalar path and x86 was token-exact by accident; that
+     * commit silently made every AVX2 box lossy by default. Defaulting to off
+     * restores the behaviour users actually had.
+     *
+     * Cost of turning it on: ~+5.8e-4 relative error per dot from the activation
+     * quantization (colibri.c:910-915 measures the same mechanism at ~+0.117
+     * nats/token on GLM, which is why GLM keeps q/k/v off IDOT). On AVX2-only
+     * hardware it is also not faster: 11.01 vs 10.67 tok/s measured on an
+     * i5-9600K, n=4 interleaved. Set IDOT=1 to opt in knowingly. */
     static int idot = -1;
-    if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
+    if (idot < 0) { const char *e = getenv("IDOT"); idot = (e && *e == '1'); }
+#ifdef OLMOE_TESTING
+    if (matmul_q_idot_force >= 0) idot = matmul_q_idot_force;
+#endif
     if (idot && I % 16 == 0 && I <= 4096) {
         int nb = I / 16; int8_t xi[4096]; float xs[256];
         for (int b = 0; b < nb; b++) {
@@ -177,30 +274,12 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
     for (int o = 0; o < O; o++) {
         const int8_t *w = q + (int64_t)o * I;
         float acc = 0.f;
+        #pragma omp simd reduction(+:acc)
         for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
         y[o] = acc * scale[o];
     }
 }
 
-/* quantizza un weight f32 [O,I] -> int8 q[O,I] + scala[O], simmetrica per riga.
- * Replica quant_dequant() del Python: scale = amax(|w|, riga)/qmax, q = round(w/scale). */
-static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits) {
-    int qmax = (1 << (bits - 1)) - 1;     /* 8->127, 4->7, 2->1 */
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const float *wr = w + (int64_t)o * I;
-        float amax = 0.f; for (int i = 0; i < I; i++) { float a = fabsf(wr[i]); if (a > amax) amax = a; }
-        float s = amax / qmax; if (s < 1e-8f) s = 1e-8f;
-        scale[o] = s;
-        int8_t *qr = q + (int64_t)o * I;
-        for (int i = 0; i < I; i++) {
-            int v = (int)lrintf(wr[i] / s);
-            if (v >  qmax) v =  qmax;
-            if (v < -qmax-1) v = -qmax-1;
-            qr[i] = (int8_t)v;
-        }
-    }
-}
 
 /* rmsnorm su una riga di lunghezza D, in-place su out (out puo' essere == x) */
 static void rmsnorm_row(float *out, const float *x, const float *w, int D, float eps) {
@@ -289,7 +368,13 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         m->cache[i].slots = calloc(cap, sizeof(Slot));
     }
     /* IMPROVEMENT 2: frequency heatmap for hot expert pinning */
-    m->freq = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint32_t));
+    rt_init("olmoe", c->n_layers, c->n_experts);
+    rt_drop_row(c->n_layers);                     /* every olmoe layer routes; no MTP row */
+    m->freq = rt_counts_all();                    /* alias: the read sites keep their shape */
+    { const char *up = getenv("COLI_USAGE");      /* optional history to seed from */
+      if (up && *up) { int64_t h = rt_load(up);
+        if (h > 0) fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n",
+                           (long long)h, up); } }
     m->hot_pinned = 0; m->freq_token_count = 0;
     m->hot_n         = getenv("HOT")    ? atoi(getenv("HOT"))    : 0;
     m->warmup_tokens = getenv("WARMUP") ? atoi(getenv("WARMUP")) : 5;
@@ -302,6 +387,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     m->pilot_smooth = sv;
     m->is_pinned = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint8_t));
     m->is_queued = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint8_t));
+    m->last_access = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint64_t));
     float cl = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
     if (cl < 0.1f) cl = 0.1f; if (cl > 1.0f) cl = 1.0f;
     m->pilot_conf_limit = cl;
@@ -392,7 +478,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     if (!ts || ts->numel != want_s) {
         fprintf(stderr, "%s: scale array is %lld elems — expected %lld, refusing (untrusted container)\n",
                 qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1); }
-    st_read_raw(&m->S, nm, s->g, 1);
+    st_read_raw(&m->S, nm, s->g, g_expert_drop);
     st_read_f32(&m->S, qsnm, s->gs, 0);  /* scales are F32; use typed reader for dtype safety */
 }
 
@@ -402,6 +488,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     pthread_mutex_lock(&g_pilot_mx);
     for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
         m->hits++; lc->slots[i].used = ++m->clock; *out = &lc->slots[i];
+        if (m->last_access) m->last_access[layer * m->c.n_experts + eid] = m->clock;
         pthread_mutex_unlock(&g_pilot_mx);
         return;
     }
@@ -426,7 +513,22 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
                 if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
             }
         }
-        if (lru < 0) lru = 0; /* absolute last resort: all in-flight, evict slot 0 */
+        while (lru < 0) {
+            /* EVERY slot is in flight: each buffer is owned by an unlocked pread
+             * in the pilot worker (or a demand load) that will publish into it.
+             * The old last resort (lru=0) stole such a slot mid-load — two writers
+             * racing the same slab, then whichever published last decided the
+             * expert id the resident bytes answered to. Wait for a publish instead
+             * and rescan; in-flight always drains because a load either finishes
+             * or the process is already dead in the water. */
+            pthread_mutex_unlock(&g_pilot_mx);
+            sleep_ms(1);
+            pthread_mutex_lock(&g_pilot_mx);
+            for (int i = 0; i < lc->n; i++) {
+                if (lc->slots[i].eid < 0) continue;
+                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+            }
+        }
         s = &lc->slots[lru];
         s->pinned = 0;
     }
@@ -440,6 +542,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     s->eid = eid;
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
     s->used = ++m->clock;
+    if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     *out = s;
     pthread_mutex_unlock(&g_pilot_mx);
 }
@@ -455,12 +558,13 @@ static void pin_hot_experts(Model *m) {
     
     int pinned_total = 0;
     for (int l = 0; l < c->n_layers; l++) {
-        uint32_t *freq_l = m->freq + (int64_t)l * c->n_experts;
-        
+        uint32_t *freq_l = m->freq[l];
+        if (!freq_l) continue;                    /* a layer with no row cannot be ranked */
+
         uint64_t layer_total = 0;
         for (int e = 0; e < c->n_experts; e++) layer_total += freq_l[e];
         if (layer_total == 0) continue;
-        
+
         int max_pin = m->cache[l].cap - 8;
         if (max_pin < 4) max_pin = 4;
         
@@ -613,21 +717,40 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
                 if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
             }
-            idx[kk] = best; val[kk] = bv;
+            /* SEC: all-NaN probabilities leave best at -1, which reaches
+             * expert_get() and then last_access[layer*E - 1] -- a heap write at
+             * a negative index. See rt_router_pick in route_trace.h. */
+            best = rt_router_pick(best, kk, E, layer);
+            idx[kk] = best; val[kk] = pr[best];
         }
         if (c->norm_topk) { float sm=0; for(int kk=0;kk<K;kk++) sm+=val[kk]; for(int kk=0;kk<K;kk++) val[kk]/=sm; }
         /* IMPROVEMENT 2: update activation heatmap (before pinning activates) */
         if (!m->hot_pinned && m->freq) {
-            uint32_t *freq_l = m->freq + (int64_t)layer * E;
-            for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
+            uint32_t *freq_l = m->freq[layer];
+            if (freq_l) for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
         }
         const float *xs = x + (int64_t)s*D;
         for (int kk = 0; kk < K; kk++) {
             Slot *e; expert_get(m, layer, idx[kk], &e);
+#if defined(__AVX2__)
+            /* FUSED3: same contract as matmul_q's IDOT fast branch (IDOT env,
+             * dims %16==0, <=4096) — outside it the stock calls below run
+             * unchanged. Exact integer arithmetic only: bit-identical output
+             * (verified by memcmp in tests/bench_fused3.c). OFF by default. */
+            static int idot_moe = -1;
+            if (idot_moe < 0) { const char *ie = getenv("IDOT"); idot_moe = !(ie && *ie == '0'); }
+            if (g_fused3 && idot_moe && D % 16 == 0 && D <= 4096 && I % 16 == 0 && I <= 4096) {
+                matmul_q_idot_pair_v3(g, u, xs, e->g, e->gs, e->u, e->us, D, I);   /* gate+up share one quant of xs */
+                for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+                matmul_q_idot_v3(hh, g, e->d, e->ds, I, D);                        /* down_proj [D,I] */
+            } else
+#endif
+            {
             matmul_q(g, xs, e->g, e->gs, D, I);     /* gate_proj [I,D] */
             matmul_q(u, xs, e->u, e->us, D, I);     /* up_proj   [I,D] */
             for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
             matmul_q(hh, g, e->d, e->ds, I, D);     /* down_proj [D,I] */
+            }
             float w = val[kk];
             float *os = out + (int64_t)s*D;
             for (int d = 0; d < D; d++) os[d] += w * hh[d];
@@ -719,6 +842,20 @@ static void pilot_realload(Model *m, int layer, int eid) {
             pthread_mutex_unlock(&g_pilot_mx);
             return; /* all pinned/in-flight, skip */
         }
+
+        /* LFRU eviction guard: don't displace a warm resident expert with a speculation */
+        if (g_pilot_evict_guard && m->freq && m->freq[layer] && m->last_access &&
+            lc->slots[lru].eid >= 0) {
+            int vid = lc->slots[lru].eid;
+            uint64_t vs = lfru_score(m->freq[layer][vid], m->last_access[layer * c->n_experts + vid], m->clock);
+            uint64_t cs = lfru_score(m->freq[layer][eid], m->last_access[layer * c->n_experts + eid], m->clock);
+            if (cs <= vs + (vs >> 2) + (4u << 8)) {
+                m->is_queued[layer * c->n_experts + eid] = 0;
+                pthread_mutex_unlock(&g_pilot_mx);
+                return; /* drop speculation */
+            }
+        }
+
         s = &lc->slots[lru]; s->pinned = 0;
     }
     s->eid = -1; s->used = ++m->clock;
@@ -730,6 +867,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
     s->eid = eid;
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
     s->used = ++m->clock;
+    if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     m->is_queued[layer * c->n_experts + eid] = 0;
     pthread_mutex_unlock(&g_pilot_mx);
 }
@@ -926,6 +1064,310 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     return scored;
 }
 
+/* ---------- interactive chat mode (CHAT=1) ---------- */
+/* OLMoE-Instruct's real template (tokenizer_config.json's chat_template):
+ *   {{bos_token}}<|user|>\n{msg}\n<|assistant|>\n{reply}{eos_token}\n<|user|>\n...
+ * bos_token == eos_token == "|||IP_ADDRESS|||" (a genuine OLMoE tokenizer quirk,
+ * a PII-scrubbing artifact repurposed as the BOS/EOS marker — not a bug here).
+ * It's an added special token, so tok_encode() tokenizes the literal string as
+ * one atomic id, same as any other added token. <|user|>/<|assistant|> are NOT
+ * special tokens in this tokenizer — just plain text the model was trained to
+ * treat as turn markers.
+ * Turn 1 gets bos_token with no separator before "<|user|>"; every later turn
+ * gets eos_token+"\n" first (closing the previous assistant turn we never
+ * explicitly appended to history, matching the is_stop-skips-append design
+ * below) before its own "<|user|>...". */
+static int fmt_user_turn(char *out, int cap, const char *msg, int first_turn) {
+    int n = first_turn
+        ? snprintf(out, cap, "|||IP_ADDRESS|||<|user|>\n%s\n<|assistant|>\n", msg)
+        : snprintf(out, cap, "|||IP_ADDRESS|||\n<|user|>\n%s\n<|assistant|>\n", msg);
+    return (n < 0 || n >= cap) ? -1 : n;
+}
+
+/* KV cache allocated ONCE for ctx_cap and never reallocated — hist_len only
+ * grows (or resets to 0 on /reset), so every turn after the first reuses the
+ * previous turns' cached keys/values: real multi-turn context, not a fresh
+ * generate() call per message. ctx_cap capped at 4096: attention()'s per-head
+ * score buffer (sc[4096]) is fixed-size, any position >= 4096 would overflow it. */
+static void run_chat(Model *m, Tok *T, int ctx_cap) {
+    Cfg *c = &m->c;
+    m->max_t = ctx_cap;
+    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    for (int i = 0; i < c->n_layers; i++) {
+        m->K[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+        m->V[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+    }
+
+    int tok_eos = tok_id_of(T, "|||IP_ADDRESS|||");
+    stops_arm_tok(c, tok_eos, T);
+
+    int max_new = getenv("MAX_NEW") ? atoi(getenv("MAX_NEW")) : 512;
+    if (max_new < 1) max_new = 1;
+
+    int *hist = malloc((size_t)ctx_cap * sizeof(int));
+    int hist_len = 0;
+    int first_turn = 1;
+
+    char *line = malloc(8192);
+    char *turn = malloc(8192 + 64);
+    int  *newids = malloc(8192 * sizeof(int));
+    int  *gen = malloc((size_t)max_new * sizeof(int));
+    char *outbuf = malloc(65536);
+
+    fprintf(stderr, "olmoe chat — SNAP=%s, ctx=%d, TEMP=%.2f, NUCLEUS=%.2f\n"
+                     "  type a message and press enter; /reset clears context; Ctrl-D exits\n",
+            getenv("SNAP"), ctx_cap, g_temp, g_nuc);
+
+    for (;;) {
+        printf("\n> "); fflush(stdout);
+        if (!fgets(line, 8192, stdin)) break;
+        size_t L = strlen(line);
+        while (L > 0 && (line[L-1] == '\n' || line[L-1] == '\r')) line[--L] = 0;
+        if (L == 0) continue;
+        if (!strcmp(line, "/reset")) { hist_len = 0; first_turn = 1; fprintf(stderr, "[chat] context reset\n"); continue; }
+
+        int tn = fmt_user_turn(turn, 8192 + 64, line, first_turn);
+        if (tn < 0) { fprintf(stderr, "[chat] message too long, skipped\n"); continue; }
+        first_turn = 0;
+        int nn = tok_encode(T, turn, tn, newids, 8192);
+
+        if (hist_len + nn + max_new > ctx_cap) {
+            fprintf(stderr, "[chat] context window full (%d/%d tokens) — /reset to start over\n",
+                    hist_len + nn, ctx_cap);
+            continue;
+        }
+
+        float *logit = step(m, newids, nn, hist_len);
+        hist_len += nn;
+
+        /* Every token counted in hist_len must have gone through step() exactly
+         * once (that's what writes its KV-cache slot) — otherwise a later turn's
+         * attention would read an uninitialized slot. So even on the turn's LAST
+         * token we still call step() once to populate its KV before breaking;
+         * only its returned logit (which nothing will consume) is discarded. */
+        int ngen = 0;
+        for (int s = 0; s < max_new; s++) {
+            int nt = pick_tok(logit, c->vocab, -1);
+            free(logit); logit = NULL;
+            if (is_stop(nt)) break;
+            hist[hist_len] = nt; gen[ngen++] = nt; hist_len++;
+            int room_left = (s < max_new - 1) && (hist_len < ctx_cap);
+            logit = step(m, &nt, 1, hist_len - 1);
+            if (!room_left) {
+                if (hist_len >= ctx_cap) fprintf(stderr, "\n[chat] context window full mid-reply — /reset to start over\n");
+                free(logit); logit = NULL;
+                break;
+            }
+        }
+
+        int outn = tok_decode(T, gen, ngen, outbuf, 65535);
+        outbuf[outn] = 0;
+        printf("%s\n", outbuf);
+        fflush(stdout);
+    }
+    free(line); free(turn); free(newids); free(gen); free(outbuf); free(hist);
+}
+
+/* ---------- serve mode: openai_server.py engine protocol ----------
+ * stdin:  SUBMIT <id> <slot> <len> <max_tokens> <temp> <top_p>\n<payload>\n
+ *         CANCEL <id>\n
+ * stdout: READY sentinel once loaded, then per request a stream of
+ *         DATA <id> <size>\n<bytes>\n frames and a final
+ *         DONE <id> STAT <tok> <tps> <hit%> <rss> <prompt_tok> <len_limited>\n
+ * Byte-identical to colibri.c's serve protocol (inkling.c documents it in
+ * full above its own SUBMIT handling) so the shared openai_server.py gateway
+ * drives olmoe unchanged.
+ *
+ * v1 scope, same as Inkling's first serve mode: one request in flight, full
+ * re-prefill every turn, no cross-request KV reuse. The payload arrives
+ * already rendered by openai_server.py's render_chat_olmoe (bos/eos turn
+ * markers and all) -- this engine tokenizes it as-is, the same way run_chat()
+ * feeds fmt_user_turn()'s output to tok_encode() above. Because nothing here
+ * persists state across requests, a fresh prefill at pos_base=0 is enough to
+ * start clean: attention() only ever reads positions [0, kv_len), so the
+ * previous request's leftover K/V contents past the new prompt's length are
+ * never touched, the same invariant CHAT mode's /reset already relies on
+ * (it clears hist_len, not the K/V buffers themselves). */
+
+typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
+#define SRV_QMAX 16
+static SReq g_q[SRV_QMAX]; static int g_qn = 0;
+static const ColiServeWireProfile olmoe_wire = {
+    .max_header_bytes = 511,
+    .max_payload_bytes = 1u << 22,
+    .max_tokens = 1 << 20,
+    .require_exact_lf = 1,
+    .require_finite_sampling = 0,
+};
+
+/* read one control line (+ payload for SUBMIT). cur_id: request in flight;
+ * returns 1 if that request was cancelled, 0 otherwise, -1 on input EOF. */
+static int serve_read_cmd(FILE *in, FILE *out, const char *cur_id) {
+    ColiServeCommand command;
+    ColiServeReadResult result = coli_serve_read_command(in, &olmoe_wire, &command);
+    if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) return -1;
+    if (result == COLI_SERVE_READ_NOMEM) {
+        coli_serve_write_error(out, command.id, "out of memory");
+        return -1;
+    }
+    if (result == COLI_SERVE_READ_BAD_REQUEST &&
+        command.kind == COLI_SERVE_COMMAND_SUBMIT) {
+        coli_serve_write_error(out, command.id, "bad submit header");
+        return -1;
+    }
+    if (result != COLI_SERVE_READ_OK) return 0;
+    if (command.kind == COLI_SERVE_COMMAND_CANCEL) {
+        int cancelled = cur_id && !strcmp(command.id, cur_id);
+        coli_serve_command_dispose(&command);
+        return cancelled;
+    }
+    if (command.kind == COLI_SERVE_COMMAND_SUBMIT) {
+        if (g_qn < SRV_QMAX) {
+            SReq *q = &g_q[g_qn++];
+            snprintf(q->id, sizeof(q->id), "%s", command.id);
+            q->max_tok = command.max_tokens;
+            q->temp = command.temperature;
+            q->top_p = command.top_p;
+            q->payload = (char *)coli_serve_command_take_payload(&command);
+            q->plen = (int)command.payload_bytes;
+        } else {
+            coli_serve_write_error(out, command.id, "queue full");
+        }
+    }
+    coli_serve_command_dispose(&command);
+    return 0;
+}
+
+static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
+    Cfg *c = &m->c;
+    int cap = q->plen + 16;
+    int *ids = malloc((size_t)cap * sizeof(int));
+    int np = tok_encode(T, q->payload, q->plen, ids, cap);
+    if (np <= 0) { coli_serve_write_error(stdout, q->id, "empty prompt"); free(ids); return 0; }
+    if (np + q->max_tok > ctx_cap) {
+        char message[128];
+        snprintf(message, sizeof(message), "context exceeds CTX (%d + %d > %d)",
+                 np, q->max_tok, ctx_cap);
+        coli_serve_write_error(stdout, q->id, message); free(ids); return 0;
+    }
+    g_temp = q->temp; g_nuc = q->top_p;
+    double t0 = now_s();
+    uint64_t h0 = m->hits, m0 = m->miss;
+    float *logit = step(m, ids, np, 0);
+    int hist_len = np, gen = 0, limited = 1, cancelled = 0;
+    char buf[512];
+    for (int s = 0; s < q->max_tok && !cancelled; s++) {
+        int nt = pick_tok(logit, c->vocab, -1);
+        free(logit); logit = NULL;
+        if (is_stop(nt)) { limited = 0; break; }
+        int nb = tok_decode(T, &nt, 1, buf, sizeof(buf)-1);
+        coli_serve_write_data(stdout, q->id, buf, (size_t)nb);
+        gen++; hist_len++;
+        while (coli_stdin_readable()) {
+            int r = serve_read_cmd(stdin, stdout, q->id);
+            if (r < 0) { free(ids); return -1; }
+            if (r > 0) { cancelled = 1; limited = 0; }
+        }
+        /* Unlike run_chat(), we do not step() the final token just to populate
+         * its KV slot: nothing in serve mode reads past this request's own
+         * reply, so a discarded logit here costs nothing. */
+        if (cancelled || s == q->max_tok - 1 || hist_len >= ctx_cap) break;
+        logit = step(m, &nt, 1, hist_len - 1);
+    }
+    free(logit);
+    double dt = now_s() - t0;
+    double tot = (double)(m->hits - h0 + m->miss - m0);
+    ColiServeDone done = {
+        .completion_tokens = gen,
+        .tokens_per_second = dt > 0 ? gen/dt : 0.0,
+        .cache_hit_percent = tot ? 100.0*(m->hits-h0)/tot : 0.0,
+        .rss_gb = rss_gb(),
+        .prompt_tokens = np,
+        .length_limited = limited,
+    };
+    coli_serve_write_done(stdout, q->id, &done);
+    /* PROF: per-turn phase timings for the dashboard. olmoe.c does not split
+     * its wall time into fill/expert/shared/attn phases the way glm.c and
+     * inkling.c do, so this reports total time only; a real phase breakdown
+     * is future work, not a protocol requirement. */
+    printf("PROF %.3f %d %d 0.0 0.0 0.0 0.0 0.0 %d\n", dt, np, gen, gen + 1);
+    fflush(stdout);
+    free(ids);
+    return 0;
+}
+
+/* dashboard HWINFO/TIERS/EMAP: same lines the other serve-capable engines
+ * emit for the web dashboard's hardware panel and Brain page. olmoe.c is
+ * CPU-only (no CUDA/Metal backend), so the GPU fields are always empty, and
+ * every layer is a MoE layer (no dense/sparse split like GLM-5.2), so the
+ * tier scan below runs over all n_layers unconditionally. */
+static void serve_hwinfo(Model *m) {
+    (void)m;
+    char cpu[256] = ""; int cores = 0; double rt = 0, ra = 0;
+    FILE *ci = fopen("/proc/cpuinfo", "r");
+    if (ci) { char ln[256];
+        while (fgets(ln, sizeof(ln), ci)) if (!strncmp(ln, "model name", 10)) {
+            char *p = strchr(ln, ':'); if (p) { p++; while (*p == ' ') p++;
+            int n = (int)strlen(p); if (n > 0 && p[n-1] == '\n') p[--n] = 0;
+            snprintf(cpu, sizeof(cpu), "%s", p); } break; }
+        fclose(ci); }
+#ifdef _SC_NPROCESSORS_ONLN
+    cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    FILE *mi = fopen("/proc/meminfo", "r");
+    if (mi) { char ln[256]; double v = 0;
+        while (fgets(ln, sizeof(ln), mi)) {
+            if (sscanf(ln, "MemTotal: %lf", &v) == 1) rt = v/1e6;
+            if (sscanf(ln, "MemAvailable: %lf", &v) == 1) ra = v/1e6;
+        } fclose(mi); }
+    printf("HWINFO %d %.1f %.1f 0 0.0 %s|\n", cores, rt, ra, cpu[0] ? cpu : "unknown");
+    fflush(stdout);
+}
+
+static void serve_tiers_emap(Model *m) {
+    Cfg *c = &m->c; int E = c->n_experts;
+    int filled = 0;
+    for (int i = 0; i < c->n_layers; i++) filled += m->cache[i].n;
+    int64_t I = c->inter, D = c->hidden;
+    /* per-expert resident bytes: int8 gate/up/down + one f32 scale per row */
+    int64_t slotb = 3*I*D + (2*I+D)*4;
+    printf("TIERS 0 %d %d 0.00 %.2f\n", filled, c->n_layers*E - filled, filled*(double)slotb/1e9);
+    /* EMAP: 1 byte/expert hex — tier(2b: 0=disk 1=RAM)<<6 | heat(6b: log2 usage) */
+    char *hex = malloc((size_t)c->n_layers*E*2 + 1); int w = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        for (int e = 0; e < E; e++) {
+            int tier = 0;
+            for (int z = 0; z < lc->n; z++) if (lc->slots[z].eid == e) { tier = 1; break; }
+            uint32_t u = m->freq[i] ? m->freq[i][e] : 0;
+            int heat = 0; while (u) { heat++; u >>= 1; } if (heat > 63) heat = 63;
+            int b = (tier << 6) | heat;
+            hex[w++] = "0123456789abcdef"[b >> 4];
+            hex[w++] = "0123456789abcdef"[b & 15];
+        }
+    }
+    hex[w] = 0;
+    printf("EMAP %d %d %s\n", c->n_layers, E, hex);
+    fflush(stdout); free(hex);
+}
+
+static void serve_loop(Model *m, Tok *T, int ctx_cap) {
+    coli_serve_stdio_init();
+    int tok_eos = tok_id_of(T, "|||IP_ADDRESS|||");
+    stops_arm_tok(&m->c, tok_eos, T);
+    coli_serve_write_ready(stdout, rss_gb());
+    serve_hwinfo(m);
+    serve_tiers_emap(m);
+    for (;;) {
+        while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) return;
+        SReq q = g_q[0];
+        memmove(g_q, g_q + 1, (size_t)(--g_qn) * sizeof(SReq));
+        int fatal = serve_one(m, T, &q, ctx_cap);
+        free(q.payload);
+        if (fatal < 0) return;
+    }
+}
+
 /* ---------- lettura ref.json ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
@@ -935,10 +1377,14 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
 }
 
 int main(int argc, char **argv) {
+    coli_omp_tune_threads("olmoe");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
+    g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
+    g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 0;
+    g_fused3     = getenv("FUSED3") ? atoi(getenv("FUSED3")) : 0;
     if (g_wide < 1) g_wide = 1;
     if (g_wide > 4) g_wide = 4;
     int hot_n  = getenv("HOT")   ? atoi(getenv("HOT"))   : 0;
@@ -948,13 +1394,67 @@ int main(int argc, char **argv) {
         fprintf(stderr, "quant_bits must be 2..8 (got %d)\n", bits);
         return 1;
     }
+
+    /* SERVE=1: openai_server.py drives the engine over stdin/stdout (READY
+     * handshake, SUBMIT/CANCEL, DATA/DONE/PROF frames, HWINFO/TIERS/EMAP for
+     * the dashboard) — same protocol as colibri.c/inkling.c/kimi_k3.c. v1:
+     * one request at a time, full re-prefill every turn (see serve_one()). */
+    if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
+        int ctx_cap = getenv("CTX") ? atoi(getenv("CTX")) : 4096;
+        if (ctx_cap < 1 || ctx_cap > 4096) {   /* attention()'s sc[4096] score buffer hard-caps this */
+            fprintf(stderr, "CTX must be 1..4096 (got %d)\n", ctx_cap);
+            return 1;
+        }
+        Model m; model_init(&m, snap, cap, bits);
+        m.max_t = ctx_cap;
+        m.K = calloc(m.c.n_layers, sizeof(float*)); m.V = calloc(m.c.n_layers, sizeof(float*));
+        for (int i = 0; i < m.c.n_layers; i++) {
+            m.K[i] = falloc((int64_t)m.c.n_heads * m.max_t * m.c.head_dim);
+            m.V[i] = falloc((int64_t)m.c.n_heads * m.max_t * m.c.head_dim);
+        }
+        Tok T;
+        char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
+        tok_load(&T, tokpath);
+        serve_loop(&m, &T, ctx_cap);
+        { const char *up = getenv("COLI_USAGE");
+          if (up && *up) rt_save(up, 0); }
+        return 0;
+    }
+
+    if (getenv("CHAT")) {   /* interactive mode: bypasses the ref.json harness entirely */
+        /* #509 convention, same as the GLM engine: COLI_TEMP is the primary channel;
+         * TEMP stays a legacy alias ONLY when it is fully numeric — on Windows and under
+         * ROCm stacks %TEMP% names a directory, and atof("C:\...") == 0.0 would silently
+         * force greedy decoding for every olmoe chat on those hosts. */
+        if (getenv("COLI_TEMP")) g_temp = (float)atof(getenv("COLI_TEMP"));
+        else if (getenv("TEMP") && *getenv("TEMP")) {
+            char *tend; double tv = strtod(getenv("TEMP"), &tend);
+            if (tend != getenv("TEMP") && *tend == '\0') g_temp = (float)tv;
+        }
+        g_nuc  = getenv("NUCLEUS") ? (float)atof(getenv("NUCLEUS")) : g_nuc;
+        int ctx_cap = getenv("CTX") ? atoi(getenv("CTX")) : 4096;
+        if (ctx_cap < 1 || ctx_cap > 4096) {   /* attention()'s sc[4096] score buffer hard-caps this */
+            fprintf(stderr, "CTX must be 1..4096 (got %d)\n", ctx_cap);
+            return 1;
+        }
+        Model m; model_init(&m, snap, cap, bits);
+        printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
+        Tok T;
+        char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
+        tok_load(&T, tokpath);
+        run_chat(&m, &T, ctx_cap);
+        { const char *up = getenv("COLI_USAGE");
+          if (up && *up) rt_save(up, 0); }
+        return 0;
+    }
+
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
 
     float smooth = getenv("SMOOTH") ? (float)atof(getenv("SMOOTH")) : 0.3f;
     float conf   = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
 
-    printf("== Streaming C engine v2.2 | cache=%d/layer bits=%d pilot=%d wide=%d hot=%d smooth=%.2f conf=%.2f ==\n",
-           cap, bits, g_pilot, g_wide, hot_n, smooth, conf);
+    printf("== Streaming C engine v2.2 | cache=%d/layer bits=%d pilot=%d wide=%d guard=%d hot=%d smooth=%.2f conf=%.2f fused3=%d ==\n",
+           cap, bits, g_pilot, g_wide, g_pilot_evict_guard, hot_n, smooth, conf, g_fused3);
 
     FILE *f = fopen(refpath, "rb"); if (!f) { perror(refpath); return 1; }
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
@@ -976,7 +1476,8 @@ int main(int argc, char **argv) {
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
         free(buf); free(arena);
-        return 0;
+        return 0;      /* PPL is a measurement run: no rt_save on purpose, so a loss
+                        * sweep cannot fold its own tokens into the persisted ranking */
     }
 
     int *out = malloc((np + n_new) * sizeof(int));
@@ -1012,7 +1513,18 @@ int main(int argc, char **argv) {
         }
     }
 
+    { const char *up = getenv("COLI_USAGE");
+      if (up && *up) rt_save(up, 0); }              /* same bytes as every other engine */
     printf("Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
+    /* One line, every engine, one format: `coli tune` sweeps scheduling knobs and
+     * needs tokens-and-elapsed to compare candidates. Before this only colibri
+     * emitted a parseable throughput line (REPLAY decode), so the tuner was
+     * GLM-only and bannered the right model while launching the wrong engine
+     * (#898). Printed to stdout, which is what autotune captures.
+     * Tokens and seconds, not tok/s: the ratio is derived by the caller at full
+     * precision (#852 -- two decimals of tok/s is one significant digit at the
+     * rates this engine runs at). */
+    printf("TUNE decode: %d tokens in %.3fs\n", n_new, dt);
     free(buf); free(arena);
     return 0;
 }

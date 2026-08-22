@@ -28,6 +28,10 @@ is safe on any machine. See also [SETTINGS.md](SETTINGS.md) and
 | `KVSAVE=0` | disable KV-cache persistence |
 | `TF=1` | teacher-forcing validation |
 
+Automatic history pinning and the adaptive LRU share the same expert RAM
+budget. Colibri caps automatic pinning to preserve the no-pin LRU capacity;
+explicit `PIN` and `PIN_GB` settings remain authoritative.
+
 ## Resource policy
 
 `coli plan` reports the planned hot (VRAM), warm (RAM), and cold backing (disk)
@@ -38,7 +42,9 @@ overrides print a warning and proceed.
 
 Auto-tier plans size OpenMP from physical cores and bind workers across cores.
 Memory-bound quantized kernels can regress sharply when SMT siblings compete for
-limited memory channels; explicit `OMP_*` settings always take precedence.
+limited memory channels. The GLM, Kimi K3, and OLMoE engines also apply that
+physical-core cap when launched directly; explicit `OMP_NUM_THREADS` and the
+`COLI_NO_OMP_TUNE` kill switch always take precedence.
 
 > Note (#471): exporting `OMP_PROC_BIND`/`OMP_PLACES` used to interact badly with
 > the engine's one-time OpenMP tuning re-exec on Linux — the re-exec'd image
@@ -53,6 +59,37 @@ coli run --auto-tier --policy quality "Explain MoE offloading"
 # Explicit research-only router reduction:
 coli run --policy experimental-fast --topk 4 "Benchmark prompt"
 ```
+
+## Measured machine profiles
+
+`coli plan` chooses a safe starting point from capacity and topology.
+`coli tune` measures the remaining scheduling choices on the actual model and
+machine, then saves a hardware/model/engine-specific profile:
+
+```bash
+coli tune --model /models/glm52_i4
+coli run --model /models/glm52_i4 --auto-tier "Explain MoE offloading"
+```
+
+The calibration prompt is generated once. Every candidate then teacher-forces
+the same continuation, so answer length and sampling do not contaminate the
+comparison. The bounded sweep only includes execution knobs such as OpenMP
+thread count, NUMA placement, I/O overlap, direct I/O, and CUDA pipelining. It
+never changes weights, quantization, router decisions, `TOPK`, `TOPP`, or
+sampling.
+
+A candidate is saved only when median throughput improves by at least 3% while
+expert hit rate remains within 0.5 percentage points and p99 latency stays
+within 20% of the baseline. The winner is then rerun before a final baseline;
+this reverse-order gate gives the baseline any remaining warm-cache advantage
+and rejects startup drift. Otherwise the baseline is recorded and no override
+is applied. Saved profiles are loaded by `--auto-tier`; explicit environment
+variables always win. Use `--no-tune-profile` to bypass a saved profile.
+
+Profiles live under `$XDG_CONFIG_HOME/colibri/tuning` (normally
+`~/.config/colibri/tuning`) or `%LOCALAPPDATA%\colibri\tuning` on Windows. A
+change to the engine binary, model metadata, CPU topology, or GPU inventory
+produces a new fingerprint instead of reusing stale measurements.
 
 Disk is an immutable recovery source, not a normal decode target. If the plan
 leaves cold expert bytes on disk, speed depends on cache hit rate; output quality
@@ -85,6 +122,11 @@ If you benchmarked colibrì before that date, rerun — your numbers were capped
 decaying session heat map replaces cold pinned experts with hotter streamed
 experts. A 25% hysteresis and a four-swap limit prevent tier thrashing.
 Persistent `.coli_usage` remains the long-term signal and is not decayed.
+
+The history's on-disk format, what happens when one engine is handed another
+engine's history, and how `PIN=<file>` differs from `PIN=auto` in how much it
+trusts a file are documented in
+[routing-telemetry.md](routing-telemetry.md).
 
 ## Router-lookahead prefetch (`PILOT=1`, experimental)
 

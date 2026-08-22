@@ -12,6 +12,7 @@ import {
   Globe,
   HardDrive,
   KeyRound,
+  AlertTriangle,
   Layers,
   Link2,
   LoaderCircle,
@@ -34,6 +35,7 @@ import { activeRequests, supportsCacheSlots } from "@/lib/runtime"
 import { Brain } from "./Brain"
 import { Profiling } from "./Profiling"
 import { persistPublicSettings, stored } from "@/lib/storage"
+import { Markdown } from "@/components/Markdown"
 import { cn } from "@/lib/utils"
 import { useLocale } from "./i18n"
 
@@ -57,7 +59,7 @@ export default function App() {
   const [models, setModels] = useState<string[]>([])
   const [model, setModel] = useState(() => stored(localStorage, "colibri.model", "glm-5.2-colibri"))
   const [temperature, setTemperature] = useState(0.7)
-  const [maxTokens, setMaxTokens] = useState(512)
+  const [maxTokens, setMaxTokens] = useState(4096)
   const [thinking, setThinking] = useState(false)
   const [cacheSlot, setCacheSlot] = useState(0)
   const [conversations, setConversations] = useState<Record<number, ChatMessage[]>>({ 0: [] })
@@ -166,10 +168,16 @@ export default function App() {
     }
   }
 
-  if (servedByEngine && !autoConnected.current && !connected) {
-    autoConnected.current = true
-    setTimeout(() => connect(), 0)
-  }
+  // Auto-connect once when the UI is served by the engine itself. In an
+  // effect, not in the render body: a side effect during render breaks under
+  // StrictMode double-rendering and concurrent re-renders.
+  useEffect(() => {
+    if (servedByEngine && !autoConnected.current && !connected) {
+      autoConnected.current = true
+      connect()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [servedByEngine, connected])
 
   const canSend = useMemo(() => draft.trim() && model && !loading, [draft, loading, model])
 
@@ -207,7 +215,7 @@ export default function App() {
           if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); firstToken = false }
           count++
           setTokenCount(count)
-          const elapsed = (performance.now() - (firstToken ? t0 : t0)) / 1000
+          const elapsed = (performance.now() - t0) / 1000
           if (elapsed > 0.3) setTokPerSec(count / ((performance.now() - t0) / 1000))
           updateMessages((current) => current.map((item) =>
             item.id === assistant.id ? { ...item, content: item.content + delta } : item,
@@ -299,7 +307,7 @@ export default function App() {
             {Array.from({ length: kvSlots }, (_, slot) => <option key={slot} value={slot}>{t("sidebar.sessionLabel", { slot: slot + 1 })}</option>)}
           </select><span className="field-help">{t("sidebar.kvSessionHelp")}</span></label> : null}
           <label><span className="label-line"><span>{t("sidebar.temperature")}</span><code>{temperature.toFixed(1)}</code></span><input className="range" type="range" min="0" max="2" step="0.1" value={temperature} onChange={(event) => setTemperature(Number(event.target.value))} /></label>
-          <label>{t("sidebar.maxTokens")}<Input type="number" min={1} max={4096} value={maxTokens} onChange={(event) => { const value = Number(event.target.value); if (Number.isFinite(value)) setMaxTokens(Math.min(4096, Math.max(1, Math.round(value)))) }} /></label>
+          <label>{t("sidebar.maxTokens")}<Input type="number" min={1} max={32768} value={maxTokens} onChange={(event) => { const value = Number(event.target.value); if (Number.isFinite(value)) setMaxTokens(Math.min(32768, Math.max(1, Math.round(value)))) }} /></label>
           <button type="button" className={cn("toggle-row", thinking && "active")} aria-pressed={thinking} onClick={() => setThinking((value) => !value)}>
             <span><BrainCircuit className="size-4" /> {t("sidebar.reasoning")}</span><i><b /></i>
           </button>
@@ -329,6 +337,7 @@ export default function App() {
               {!loading && tokPerSec != null ? <Badge className="badge-speed"><Gauge className="size-3" /> {t("topbar.tokPerSec", { n: tokPerSec.toFixed(1) })}</Badge> : null}
               {!loading && ttft != null ? <Badge><Timer className="size-3" /> TTFT {(ttft/1000).toFixed(1)}s</Badge> : null}
               {!loading && lastRun?.usage ? <Badge><Layers className="size-3" /> {lastRun.usage.prompt_tokens}→{lastRun.usage.completion_tokens}</Badge> : null}
+              {!loading && lastRun?.finishReason === "length" ? <Badge className="badge-warn" title={t("topbar.truncatedHelp")}><AlertTriangle className="size-3" /> {t("topbar.truncated")}</Badge> : null}
               {lastRun?.queueWaitMs != null ? <Badge><Clock className="size-3" /> queue {Math.round(lastRun.queueWaitMs)}ms</Badge> : null}
               <Badge><MonitorDot className="size-3" /> {t("topbar.slot", { n: cacheSlot + 1 })}</Badge>
               <Button variant="ghost" size="sm" onClick={() => { updateMessages([]); setTokPerSec(null); setTtft(null); setTokenCount(0); setTotalTokens({prompt:0,completion:0}) }} disabled={!messages.length || loading}><Trash2 className="size-3.5" /> {t("topbar.clear")}</Button>
@@ -354,7 +363,14 @@ export default function App() {
               {messages.map((item) => (
                 <article key={item.id} className={cn("message", item.role)}>
                   <div className="avatar">{item.role === "user" ? "Y" : <Feather className="size-4" />}</div>
-                  <div><div className="message-meta">{item.role === "user" ? t("chat.you") : t("chat.colibri")}</div><div className="message-body">{item.content || <span className="typing" aria-label="Generating"><i /><i /><i /></span>}</div></div>
+                  <div><div className="message-meta">{item.role === "user" ? t("chat.you") : t("chat.colibri")}</div><div className="message-body">{item.content
+                    ? (item.role === "assistant"
+                        /* User turns stay literal: the person typed those
+                           characters and expects to see them back. Only the
+                           model's output is markdown. */
+                        ? <Markdown source={item.content} />
+                        : item.content)
+                    : <span className="typing" aria-label="Generating"><i /><i /><i /></span>}</div></div>
                 </article>
               ))}
               <div ref={bottomRef} />
