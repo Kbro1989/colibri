@@ -40,6 +40,12 @@ tiers, the reason for each placement, and the expected bottleneck. The default
 and router decisions unless `--topk` or `--topp` is passed; those explicit lossy
 overrides print a warning and proceed.
 
+The plan also emits a machine-readable `next_actions` list and renders it in
+the terminal. A missing storage measurement is marked `required`; subsequent
+profiling and tuning work is `recommended`. These actions produce the evidence
+needed to improve a plan on this machine—they do not silently enable an
+unmeasured optimization.
+
 Auto-tier plans size OpenMP from physical cores and bind workers across cores.
 Memory-bound quantized kernels can regress sharply when SMT siblings compete for
 limited memory channels. The GLM, Kimi K3, and OLMoE engines also apply that
@@ -52,6 +58,38 @@ physical-core cap when launched directly; explicit `OMP_NUM_THREADS` and the
 > one core (~20× slowdown). The engine now resets its affinity to all online CPUs
 > right before the re-exec, so explicit `OMP_*` pinning works as documented.
 > `COLI_OMP_TUNED=1` remains the escape hatch that skips the re-exec entirely.
+
+### Hybrid CUDA/CPU OpenMP override
+
+The main GLM engine intentionally skips its active-wait OpenMP tuning when
+`COLI_CUDA` is set. Active worker teams have measured severe regressions by
+contending with CUDA dispatch and synchronization, so a CUDA model that still
+routes some experts through RAM is not, by itself, a reason to change that
+default.
+
+On a specific hybrid host where profiling shows the CPU expert window on the
+critical path, the supported experiment is an explicit user-owned OpenMP
+policy:
+
+```bash
+OMP_WAIT_POLICY=active GOMP_SPINCOUNT=200000 KMP_BLOCKTIME=200 \
+OMP_PROC_BIND=close OMP_DYNAMIC=FALSE \
+COLI_CUDA=1 ./coli run --model /models/glm52_i4 "Benchmark prompt"
+```
+
+The OpenMP runtime reads these variables before `main()`, so they must be set
+on the engine invocation rather than exported after startup. The engine uses
+`overwrite=0`; explicit values remain authoritative. `GOMP_SPINCOUNT` applies
+to libgomp and `KMP_BLOCKTIME` to Intel/LLVM OpenMP runtimes, so carrying both
+keeps the command portable across common builds.
+
+Treat this as a measured per-host override, not a recommended CUDA default.
+Compare it against the unchanged command with stable page-cache state and an
+interleaved run order; report CPU expert time, GPU critical time, disk wait,
+and end-to-end throughput. Reject it if GPU time grows or the CPU window was
+already hidden behind the GPU. Do not use active waiting on Apple Silicon: CPU
+spin has measured slower there by stealing the shared CPU/GPU power budget.
+`COLI_NO_OMP_TUNE=1` remains the explicit passive-policy kill switch.
 
 ```bash
 coli plan --model /models/glm52_i4 --policy quality

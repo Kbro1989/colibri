@@ -3,13 +3,35 @@
 A start-to-finish, reproducible path from a fresh Windows 11 machine to GLM-5.2 generating tokens, with the GPU tier. Every step and every failure mode below was hit and verified on real hardware: Core Ultra 9 285K (AVX-VNNI) / RTX 5080 (sm_120) / 128 GB RAM / Windows 11 24H2 (issue #306). Steps are ordered so the long downloads run while you build.
 
 ---
+
+## If you downloaded a release archive, start here
+
+The archive contains **`coli.cmd`**: that is the program to run. Double-click it
+for the quick start, or from cmd/PowerShell:
+
+```
+coli.cmd chat   --model D:\models\glm52_i4
+coli.cmd serve  --model D:\models\glm52_i4
+coli.cmd doctor --model D:\models\glm52_i4
+```
+
+`colibri.exe`, `kimi_k3.exe` and the other `.exe` files are the **engines**.
+They are selected by the launcher from the model's `config.json`; started on
+their own they have no model to load, print how to launch and exit, which from
+Explorer looks like a window that flashes and disappears (#1241). The launcher
+needs Python 3 from https://www.python.org/downloads/ with "Add python.exe to
+PATH" ticked; the engines themselves need nothing.
+
+The rest of this page is for building from source.
+
+---
 > **2026-08-11: Additional validation with detailed steps for laptop setup** \
 Lenovo Thinkpad P16v (Intel Core i7 ultra (155H 1.4GHz), 64GB RAM, 2Tb NVME drive, Nvidia RTX 2000 Ada generation 8GB (AD107, 2023)).
 Windows 11 pro english.\
 **Software installs:**\
 `- nvidia drivers` from https://www.nvidia.com/en-us/drivers/\
 `- nvidia cuda toolkit` from https://developer.nvidia.com/cuda-downloads?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local\
-`- msys2` from https://github.com/msys2/msys2-installer/releases/download/2026-06-11/msys2-x86_64-20260611.exe\
+`- msys2` from <https://github.com/msys2/msys2-installer/releases/download/2026-06-11/msys2-x86_64-20260611.exe> (the angle brackets keep the trailing line-break marker out of the link; the old form 404ed, #1405)\
 `- Microsoft Visual Studio 2022 built tools` installer from https://aka.ms/vs/17/release/vs_buildtools.exe then install Desktop Development with C++\
 `- winget install git.git python.python.3.14`\
 \
@@ -27,6 +49,8 @@ To see which code optimizations are active in gcc compiler with the native flag 
 For guidance about gcc optimizations, a good source cab be: `https://wiki.gentoo.org/wiki/GCC_optimization`\
 \
 **colibri.exe and coli_cuda.*** build from MS Visual Studio and Nvidia CUDA Toolkit:\
+\
+> **Build from a git clone, inside `c/`.** The release zip ships the engines and the Python only, no `Makefile` and no `backend_cuda.cu`: `make cuda-dll` in the unzipped release folder answers `No rule to make target 'cuda-dll'` (#1405). `git clone https://github.com/JustVugg/colibri`, then every `make` below runs in `colibri\c`.\
 Microsoft Visual Studio tools includes a `vcvars64.bat` batch file that appropriately sets all the paths. \
 It is in `"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"`\
 \
@@ -37,7 +61,7 @@ Open a command prompt shell (`cmd`, not powershell), cd to subfolder `c\` of the
 `%comspec% /k "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"`
 `set PATH=%PATH%;C:\msys64\usr\bin`\
 `cd C:\Users\YOUR_USER\COLIBRI_REPO_FOLDER\c`\
-`make cuda-dll CUDA-ARCH=sm_89`\
+`make cuda-dll CUDA_ARCH=sm_89`\
 `make colibri.exe CUDA_DLL=1 ARCH=native`\
 `make iobench.exe`\
 \
@@ -117,7 +141,7 @@ This is not Defender and not Mark-of-the-Web — SAC blocks *all* unsigned, unkn
 
 ## 3. Build the CUDA DLL (GPU tier)
 
-nvcc needs MSVC as host compiler, so this one step must run from a shell with the MSVC environment: open **"x64 Native Tools Command Prompt for VS 2022"** from the Start menu (plain PowerShell will fail the `cl` check). Then:
+nvcc needs MSVC as host compiler, so this one step must run from a shell with the MSVC environment: open **"x64 Native Tools Command Prompt for VS 2022"** from the Start menu (plain PowerShell will fail the `cl` check). Not the generic "Developer Command Prompt": that one is the 32-bit compiler, and nvcc then fails inside `cuda_fp16.hpp` with `asm operand type size(8) does not match ... constraint 'r'` (#1405). `cl` alone prints which one you have: `for x64` is the right banner. Then:
 
 > **The VS prompt has no `sh.exe` (#478):** that prompt is a `cmd.exe` shell, and the `cuda-dll` recipe uses POSIX idioms (`command -v`, `{ ...; }`) that need `/bin/sh`. Run this once in the VS prompt before building:
 > ```cmd

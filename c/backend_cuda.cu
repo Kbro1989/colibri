@@ -1836,11 +1836,12 @@ static void f8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
     grouped_down_f8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
 }
 
-extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
-                                        ColiCudaTensor *const *ups,
-                                        ColiCudaTensor *const *downs,
-                                        const int *rows, int count,
-                                        float *y, const float *x) {
+static int expert_group_impl(ColiCudaTensor *const *gates,
+                             ColiCudaTensor *const *ups,
+                             ColiCudaTensor *const *downs,
+                             const int *rows, int count,
+                             float *y, const float *x,
+                             int pin_small_batch) {
     if (fault_injected()) return 0;
     if (!gates || !ups || !downs || !rows || !x || !y || count < 1) return 0;
     ColiCudaTensor *first=gates[0];
@@ -1906,7 +1907,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
      * WMMA kernels are compiled out (COLI_HIP_NO_WMMA) the launch would
      * succeed with an EMPTY kernel and the output buffer would silently keep
      * stale data. Gate the branch like TC_W4A16 below does. */
-    tc=tc&&COLI_GPU_HAS_WMMA&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
+    tc=tc&&!pin_small_batch&&COLI_GPU_HAS_WMMA&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
     int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
     for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;
     if(all_e8){
@@ -1928,7 +1929,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
         quantize_s4_rows<<<total,256,0,ctx->stream>>>(ctx->qx,ctx->qscale,ctx->gate,total,I);
         grouped_s4_wmma<<<dim3((unsigned)((D+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->y,ctx->qx,ctx->qscale,dev,I,D,2);
-    }else if(all_s4&&COLI_GPU_HAS_WMMA&&ctx->compute_major>=7&&getenv("COLI_CUDA_TC_W4A16")&&
+    }else if(!pin_small_batch&&all_s4&&COLI_GPU_HAS_WMMA&&ctx->compute_major>=7&&getenv("COLI_CUDA_TC_W4A16")&&
              atoi(getenv("COLI_CUDA_TC_W4A16"))&&
              [&]{ int tc16_min=getenv("COLI_CUDA_TC_W4A16_MIN")?atoi(getenv("COLI_CUDA_TC_W4A16_MIN")):16;
                   for(int c=0;c<count;c++) if(rows[c]>=tc16_min) return 1;
@@ -2028,6 +2029,23 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
       g_device_group_calls[index]++; g_device_group_experts[index]+=(uint64_t)count;
       g_device_group_rows[index]+=(uint64_t)total; }
     return 1;
+}
+
+extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
+                                        ColiCudaTensor *const *ups,
+                                        ColiCudaTensor *const *downs,
+                                        const int *rows, int count,
+                                        float *y, const float *x) {
+    return expert_group_impl(gates,ups,downs,rows,count,y,x,0);
+}
+
+extern "C" int coli_cuda_expert_group_pinned(ColiCudaTensor *const *gates,
+                                               ColiCudaTensor *const *ups,
+                                               ColiCudaTensor *const *downs,
+                                               const int *rows, int count,
+                                               float *y, const float *x,
+                                               int pin_small_batch) {
+    return expert_group_impl(gates,ups,downs,rows,count,y,x,pin_small_batch);
 }
 
 /* ---- Async expert group (Inc.4): issue/take split of coli_cuda_expert_group ----
@@ -2390,6 +2408,121 @@ extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
         tensor->weight_bytes;
     return storage_bytes +
         ((tensor->fmt && tensor->fmt != 6) ? tensor->scale_count * sizeof(float) : 0);
+}
+
+/* What a cudaMalloc of `bytes` actually takes off the card.
+ *
+ * coli_cuda_tensor_bytes() above is the LOGICAL size and must stay that way -
+ * it mirrors upload and free so the three cannot drift. This is a different
+ * question: the allocator rounds a request up, and nothing was charging the
+ * difference to the expert budget.
+ *
+ * Measured on an RTX 3090 (sm_86, CUDA 13.1):
+ *
+ *     request              actual      overhead
+ *     0.75 MiB          1.00 MiB        +0.25     <- int4-g64 scale array
+ *     1.00 MiB          1.00 MiB        +0.00
+ *     1.00 MiB + 1 B    2.00 MiB        +1.00
+ *     1.50 MiB          2.00 MiB        +0.50
+ *     2.00 MiB          2.00 MiB        +0.00
+ *     2.00 MiB + 1 B    4.00 MiB        +2.00
+ *     6.00 MiB          6.00 MiB        +0.00     <- int4-g64 weight tensor
+ *
+ * A GLM-5.2 int4-g64 expert is three 6 MiB weight arrays, which are already on
+ * a boundary and cost nothing extra, and three 0.75 MiB scale arrays, each
+ * padded to 1 MiB. 3 x 0.25 = 0.75 MiB per expert unaccounted - which is the
+ * 0.741 MiB/expert (sigma 0.019) measured independently on H100 and H200 in
+ * #687, from the other direction.
+ *
+ * PROBED, not modelled. The table above is not a rule this hardcodes: the
+ * rounding is a driver and architecture property, and a formula fitted to one
+ * card would be silently wrong on the next. Probed once per distinct size
+ * and cached, so the cost does not scale with the tier.
+ *
+ * cudaMemGetInfo is the obvious alternative and it does not survive contact
+ * with the numbers: it is O(live allocations), measured 0.52 us empty and
+ * 68.2 us with 12,000 live, so charging it per expert would be quadratic
+ * across a tier that places thousands.
+ *
+ * Returns `bytes` unchanged if the probe cannot run. Under-reporting is the
+ * pre-existing behaviour and degrades to exactly what this replaced; refusing
+ * to size at all would be worse.
+ */
+#define COLI_CUDA_FOOTPRINT_CACHE 16
+static struct { size_t req, real; } g_fp_cache[COLI_CUDA_FOOTPRINT_CACHE];
+static int g_fp_cache_n = 0;
+
+/* The probe MUST allocate several buffers and divide, not one and measure it.
+ *
+ * A single cudaMalloc reserves a whole 2 MiB VMM page, so one allocation of
+ * anything smaller reads as a flat 2 MiB and the answer is the page size
+ * rather than the per-allocation cost. Later allocations suballocate from
+ * pages already reserved, so the real amortised figure only appears once
+ * enough of them are live to fill a page. Measured both ways on sm_86, same
+ * 786,432-byte request:
+ *
+ *     1 allocation    2.00 MiB   <- the page, not the allocation
+ *     64 allocations  1.00 MiB   <- the truth, and what the tier will pay
+ *
+ * The single-shot version of this function shipped in an earlier draft and its
+ * own test caught it: it over-reported every expert by 3x and would have
+ * shrunk the tier far more than the bug it fixes.
+ */
+#define COLI_CUDA_FOOTPRINT_PROBE_BYTES (24u << 20)   /* transient probe budget */
+#define COLI_CUDA_FOOTPRINT_PROBE_MAX   64
+
+extern "C" size_t coli_cuda_alloc_footprint(size_t bytes) {
+    if (!bytes) return 0;
+    for (int i = 0; i < g_fp_cache_n; i++)
+        if (g_fp_cache[i].req == bytes) return g_fp_cache[i].real;
+
+    /* Enough allocations to cross a page boundary, capped so the probe never
+     * takes a meaningful bite out of a card that is about to be filled. */
+    int want = (int)(COLI_CUDA_FOOTPRINT_PROBE_BYTES / bytes);
+    if (want < 8) want = 8;
+    if (want > COLI_CUDA_FOOTPRINT_PROBE_MAX) want = COLI_CUDA_FOOTPRINT_PROBE_MAX;
+
+    size_t free_before = 0, free_after = 0, total = 0, real = bytes;
+    void *p[COLI_CUDA_FOOTPRINT_PROBE_MAX];
+    int made = 0;
+    if (cudaMemGetInfo(&free_before, &total) == cudaSuccess) {
+        for (int i = 0; i < want; i++) {
+            if (cudaMalloc(&p[i], bytes) != cudaSuccess) break;
+            made++;
+        }
+        if (made > 0 && cudaMemGetInfo(&free_after, &total) == cudaSuccess &&
+            free_before > free_after) {
+            size_t avg = (free_before - free_after) / (size_t)made;
+            /* Only ever round UP. A concurrent free elsewhere on the device
+             * can make the delta read small, and charging less than the
+             * logical size is the failure this exists to fix. */
+            if (avg > real) real = avg;
+        }
+        for (int i = 0; i < made; i++) cudaFree(p[i]);
+    }
+    /* Cache even a failed probe: `real` is then the logical size, which is the
+     * pre-existing behaviour, and retrying per expert on a card that just
+     * refused 8 allocations would be the worst possible time to try again. */
+    if (g_fp_cache_n < COLI_CUDA_FOOTPRINT_CACHE)
+        g_fp_cache[g_fp_cache_n++] = { bytes, real };
+    return real;
+}
+
+/* Same split as coli_cuda_tensor_bytes, but per ALLOCATION rather than summed
+ * first: the weights and the scales are two separate cudaMallocs and each is
+ * rounded on its own. Summing then rounding once would miss the scale array's
+ * padding entirely, which is the whole term. */
+extern "C" size_t coli_cuda_tensor_vram(const ColiCudaTensor *tensor) {
+    if (!tensor) return 0;
+    size_t storage_bytes =
+#ifdef COLI_ANS
+        tensor->compressed ? tensor->archive_bytes :
+#endif
+        tensor->weight_bytes;
+    size_t total = coli_cuda_alloc_footprint(storage_bytes);
+    if (tensor->fmt && tensor->fmt != 6)
+        total += coli_cuda_alloc_footprint(tensor->scale_count * sizeof(float));
+    return total;
 }
 
 extern "C" int coli_cuda_tensor_device(const ColiCudaTensor *tensor) {

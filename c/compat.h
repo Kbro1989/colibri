@@ -15,6 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv / _putenv_s, used by the Windows env shims */
 #ifndef _WIN32
 #include <sys/mman.h>
 #include <unistd.h>
@@ -322,16 +323,39 @@ static inline off_t compat_fsize(int fd){
     return (off_t)li.QuadPart;
 }
 
-/* --- setenv -> SetEnvironmentVariableA (POSIX setenv assente su Windows) --- */
+/* --- setenv / unsetenv (assenti su Windows) ---
+ *
+ * A Windows process carries TWO views of its environment and they are not the
+ * same object: the Win32 environment block, which child processes inherit, and
+ * the CRT's own copy, which getenv() reads and which is populated once at
+ * startup. SetEnvironmentVariableA writes the first and leaves the second
+ * alone, so a setenv() followed by getenv() in the same process used to return
+ * the stale value -- silently, which is the worst way to not support
+ * something. Six test files had grown a private _putenv_s helper around it
+ * (#1416, #1417, #1420).
+ *
+ * _putenv_s writes the CRT copy AND keeps the Win32 block in sync, so both
+ * views agree. SetEnvironmentVariableA is kept alongside it so that a CRT that
+ * ever stopped syncing could not quietly break the inheritance the engine
+ * relies on (omp_tune.h's re-exec, inkling's OMP variables): the two calls
+ * write the same value to the two views, which is the invariant that matters.
+ *
+ * One difference from POSIX remains, and cannot be removed: the Windows CRT
+ * has no representation for a variable whose value is the empty string, so
+ * setenv(name, "", 1) REMOVES the variable instead of defining it empty. Code
+ * that distinguishes "" from unset must not rely on it. */
 static inline int compat_setenv(const char *name, const char *value, int overwrite){
     if(!overwrite && getenv(name)) return 0;
-    return SetEnvironmentVariableA(name, value) ? 0 : -1;
+    int rc = _putenv_s(name, value ? value : "");
+    SetEnvironmentVariableA(name, (value && *value) ? value : NULL);
+    return rc == 0 ? 0 : -1;
 }
 #define setenv(name,value,overwrite) compat_setenv(name,value,overwrite)
 
-/* --- unsetenv -> SetEnvironmentVariableA(NULL) --- */
 static inline int compat_unsetenv(const char *name){
-    return SetEnvironmentVariableA(name, NULL) ? 0 : -1;
+    int rc = _putenv_s(name, "");          /* empty value == remove, on Windows */
+    SetEnvironmentVariableA(name, NULL);
+    return rc == 0 ? 0 : -1;
 }
 #define unsetenv(name) compat_unsetenv(name)
 
@@ -534,6 +558,108 @@ static inline void coli_serve_binary_mode(void)
     _setmode(_fileno(stdin),  _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
     setvbuf(stdout, NULL, _IONBF, 0);
+#endif
+}
+
+/* A release archive ships the ENGINES next to the launcher, so on Windows the
+ * first thing a new user does is double-click `colibri.exe` from Explorer. The
+ * engine has no model to load, prints one line and exits -- the console window
+ * appears and vanishes, which reads as "the program does not start" (#1241).
+ *
+ * GetConsoleProcessList reports how many processes share this console: a run
+ * started from a shell has at least the shell too, while a double-click leaves
+ * the engine alone on a console Windows destroys the moment it exits. That is
+ * the only case where holding the window is right, and it is exactly the case
+ * where the message would otherwise be unreadable.
+ *
+ * No-op on Linux/macOS, and no-op on Windows whenever a shell, a script, the
+ * `coli` launcher or CI is on the other end.
+ *
+ * This is the belt, not the braces: an engine that re-execs itself for OpenMP
+ * tuning can still be sharing the console with the exiting parent at the moment
+ * we look, and then the message prints without the pause. `coli.cmd` -- shipped
+ * in the Windows archive and always correct -- is the supported entry point. */
+static inline int coli_console_is_own(void)
+{
+#ifdef _WIN32
+    DWORD owners[2];
+    return GetConsoleProcessList(owners, 2) == 1;
+#else
+    return 0;
+#endif
+}
+
+static inline void coli_hold_console(void)
+{
+    if (!coli_console_is_own()) return;
+    fprintf(stderr, "\nPress Enter to close this window. ");
+    fflush(stderr);
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF) { }
+}
+
+/* One wording for every engine: what this binary is, and the command that does
+ * what the user was trying to do. Called on the "no model" exit path, which is
+ * where a bare launch lands. `engine` is the family name for the message. */
+static inline void coli_print_launcher_help(const char *engine)
+{
+#ifdef _WIN32
+    const char *run = "coli.cmd";
+#else
+    const char *run = "./coli";
+#endif
+    fprintf(stderr,
+        "colibri: this is the %s engine, and it was started without a model.\n"
+        "The engine is not the program you run directly -- the launcher is:\n"
+        "\n"
+        "    %s chat  --model <model directory>    interactive chat\n"
+        "    %s serve --model <model directory>    OpenAI-compatible API\n"
+        "    %s web   --model <model directory>    API plus the dashboard\n"
+        "    %s doctor --model <model directory>   check a model is usable\n"
+        "\n"
+        "The launcher needs Python 3 and picks the right engine for the model.\n"
+        "Getting a model, step by step: https://github.com/JustVugg/colibri"
+        "/blob/main/docs/quickstart.md\n",
+        engine, run, run, run, run);
+    coli_hold_console();
+}
+
+/* --- RAM disponibile ADESSO, in GB, per tutte le piattaforme ---------------
+ * "Disponibile" = recuperabile senza swap: MemAvailable su Linux; free +
+ * inactive + purgeable su macOS; su Windows ullAvailPhys MA limitata da
+ * ullAvailPageFile, il commit ancora concedibile: e' quello che decide se
+ * il prossimo malloc riesce, e su una macchina con pagefile piccolo puo'
+ * essere molto meno della RAM fisica libera.
+ *
+ * #1375: glm53.c leggeva /proc/meminfo ovunque, e su Windows quel file non
+ * esiste: la funzione tornava 0, il budget della cache esperti si clampava a
+ * 1 GB, e Flash su Windows girava con uno slot per layer. colibri.c aveva la
+ * versione giusta (macOS + Windows) da mesi, come funzione sua. Due copie di
+ * cui una sbagliata: ora e' una, qui, e i motori la chiamano.
+ * 0 = non misurabile; e' il chiamante a decidere il fallback. */
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+#include <unistd.h>
+static inline double compat_mem_available_gb(void){
+#ifdef __APPLE__
+    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vm;
+    if(host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &cnt) != KERN_SUCCESS) return 0;
+    return ((double)vm.free_count + (double)vm.inactive_count + (double)vm.purgeable_count)
+           * (double)sysconf(_SC_PAGESIZE) / 1e9;
+#elif defined(_WIN32)
+    MEMORYSTATUSEX msx = {0};
+    msx.dwLength = sizeof(msx);
+    if(!GlobalMemoryStatusEx(&msx)) return 0;
+    double phys = (double)msx.ullAvailPhys / 1e9;
+    double commit = (double)msx.ullAvailPageFile / 1e9;
+    return commit > 0 && commit < phys ? commit : phys;
+#else
+    FILE *f = fopen("/proc/meminfo", "r"); if(!f) return 0;
+    char ln[256]; double kb = 0;
+    while(fgets(ln, sizeof ln, f)) if(sscanf(ln, "MemAvailable: %lf", &kb) == 1) break;
+    fclose(f); return kb / 1e6;
 #endif
 }
 

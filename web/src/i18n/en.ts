@@ -47,6 +47,11 @@ const en: Record<string, string> = {
   "sidebar.temperature": "Temperature",
   "sidebar.maxTokens": "Max output tokens",
   "sidebar.reasoning": "Reasoning",
+  "sidebar.reasoning.off": "Off",
+  "sidebar.reasoning.low": "Low",
+  "sidebar.reasoning.medium": "Medium",
+  "sidebar.reasoning.high": "High",
+  "sidebar.reasoning.max": "Max",
   "sidebar.transport": "OpenAI-compatible transport",
 
   // top bar
@@ -72,6 +77,8 @@ const en: Record<string, string> = {
   "chat.colibri": "colibrì",
   "chat.placeholder": "Message colibrì…",
   "chat.inputHint": "Enter to send · Shift+Enter for newline",
+  "chat.attachImage": "Attach an image",
+  "chat.removeImage": "Remove image",
   "chat.stop": "Stop generation",
   "chat.send": "Send message",
 

@@ -21,6 +21,7 @@ import time
 import uuid
 
 import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
+import v41_dsml                     # ...and V4.1's, whose tag names differ by a space
 from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id,
                              family_ids, resolve_model)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -84,8 +85,20 @@ def _engine_error(fields, message):
     know how to compact a conversation actually get the chance to (previously the engine
     silently truncated the prompt instead, which is #401)."""
     if fields and fields[0] == "CONTEXT_EXCEEDED":
-        limit = fields[2] if len(fields) > 2 else "the context"
-        used = fields[1] if len(fields) > 1 else "?"
+        # Two spellings of the same frame. colibri and deepseek_v4 write the
+        # original `CONTEXT_EXCEEDED <used> <limit>`; qwen36 and qwen38 write
+        # `prompt_tokens=N requested=M capacity=C`. Reading the second by
+        # position took "requested=M" (the completion budget) as the limit and
+        # printed it raw: "maximum context length is requested=4 tokens", with
+        # the real ceiling nowhere (#1376). Unifying the engines' spelling is
+        # a separate change; the server must read both meanwhile.
+        kv = dict(f.split("=", 1) for f in fields[1:] if "=" in f)
+        if kv:
+            limit = kv.get("capacity") or "the context"
+            used = kv.get("prompt_tokens") or "?"
+        else:
+            limit = fields[2] if len(fields) > 2 else "the context"
+            used = fields[1] if len(fields) > 1 else "?"
         return APIError(400,
                         f"This model's maximum context length is {limit} tokens, however your "
                         f"messages resulted in at least {used} tokens. Please shorten the "
@@ -455,8 +468,9 @@ def parse_dsv4_tool_calls(reply):
     return content.strip(), calls
 
 
-# K3 tool-call markers as re-emitted literally by kimi_k3.c's serve loop (#1143): the
-# structural XTML runs the engine would otherwise suppress come through as literal text.
+# K3 tool-call XTML carried on the engine-authenticated TOOL sideband (#1147).
+# Older #1144 engines placed the same bytes on DATA; parse_arch_tool_calls keeps
+# that path only when a request did not declare an authoritative sideband.
 K3_TOOLS_OPEN = "<|open|>tools<|sep|>"
 _K3_TOOLS_RE = re.compile(r"<\|open\|>tools<\|sep\|>(.*?)<\|close\|>tools<\|sep\|>", re.DOTALL)
 _K3_CALL_RE = re.compile(
@@ -473,7 +487,7 @@ def _k3_unescape_attr(s):
 
 
 def parse_k3_tool_calls(reply, tools=None):
-    """Return (content, tool_calls) from K3's literally re-emitted XTML tool block."""
+    """Return (content, tool_calls) from K3's engine-proven XTML tool block."""
     calls = []
     blocks = [m.group(1) for m in _K3_TOOLS_RE.finditer(reply)]
     text = _K3_TOOLS_RE.sub("", reply)
@@ -519,12 +533,41 @@ def parse_k3_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
-def parse_arch_tool_calls(reply, tools):
+def parse_dsv41_tool_calls(reply):
+    """Parse DeepSeek V4.1 DSML tool calls out of one assistant reply.
+
+    Same posture as the V4 path: the vendored reference parser decodes the block
+    strictly, and the gateway then cuts an incomplete block out of the visible
+    content so raw DSML never reaches the client, whatever the model did with
+    its token budget.
+    """
+    content, calls = v41_dsml.parse_completion_text(reply)
+    if not calls:
+        cut = len(content)
+        for marker in (v41_dsml.TOOL_CALLS_PREFIX, v41_dsml.TOOL_CALL_PREFIX):
+            pos = content.find(marker)
+            if 0 <= pos < cut:
+                cut = pos
+        if cut < len(content):
+            content = content[:cut]
+    for marker in (v41_dsml.eos_token, THINK_OPEN, THINK_CLOSE):
+        content = content.replace(marker, "")
+    return content.strip(), calls
+
+
+def parse_arch_tool_calls(reply, tools, tool_reply=None):
     """Architecture-appropriate tool-call parser. Returns (content, tool_calls)."""
     if ARCH == "deepseek_v4":
         return parse_dsv4_tool_calls(reply)
+    if ARCH == "deepseek_v41":
+        return parse_dsv41_tool_calls(reply)
     if ARCH == "kimi":
-        return parse_k3_tool_calls(reply, tools)
+        if tool_reply is not None:
+            _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
+            return reply.strip(), calls
+        return parse_k3_tool_calls(reply, tools)  # compatibility with pre-#1147 engines
+    if ARCH == "qwen38":
+        return parse_qwen38_tool_calls(reply, tools)
     return parse_tool_calls(reply, tools)
 
 
@@ -532,6 +575,10 @@ def _tool_stream_markers():
     """Marker(s) that open a model tool-call block, in match order (arch-specific)."""
     if ARCH == "deepseek_v4":
         return ("<" + DSV4_DSML + "tool_calls", "<" + DSV4_DSML + "invoke")
+    if ARCH == "deepseek_v41":
+        # V4.1's tag names lead with a space (" calls", " invoke"): building these the
+        # V4 way would suppress nothing and leak the block into delta.content.
+        return (v41_dsml.TOOL_CALLS_PREFIX, v41_dsml.TOOL_CALL_PREFIX)
     if ARCH == "kimi":
         return (K3_TOOLS_OPEN,)
     return (BOX_START,)
@@ -553,7 +600,7 @@ def _tool_hold():
 
 
 ARCH = "glm"   # set in main(): a family id from family_registry (glm | inkling |
-               # kimi | olmoe | qwen36 | deepseek_v4)
+               # kimi | olmoe | qwen36 | qwen38 | deepseek_v4)
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
 
@@ -1197,6 +1244,221 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
     return "".join(parts)
 
 
+# Qwen3.8 declares and emits tool calls in an XML-ish form of its own, not the
+# JSON block GLM uses and not DeepSeek's DSML -- so it needs its own renderer and
+# its own parser. Both sides are transcribed from chat_template.jinja rather than
+# paraphrased, because a tool preamble the model has not seen verbatim is a
+# different prompt: the declaration is what teaches it the syntax it must emit.
+#
+#   <tool_call>
+#   <function=NAME>
+#   <parameter=KEY>
+#   VALUE
+#   </parameter>
+#   </function>
+#   </tool_call>
+QWEN38_TOOL_PREAMBLE = ("\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>")
+
+
+def _qwen38_tool_block(tools):
+    """The `# Tools` system section, byte-identical to the template's."""
+    lines = ["# Tools\n\nYou have access to the following functions:\n\n<tools>"]
+    for tool in tools:
+        lines.append("\n" + json.dumps(tool, ensure_ascii=False, separators=(", ", ": ")))
+    lines.append("\n</tools>")
+    lines.append(QWEN38_TOOL_PREAMBLE)
+    return "".join(lines)
+
+
+def _qwen38_tool_calls(tool_calls, has_content, index):
+    """Render assistant tool_calls. The template separates the FIRST call from
+    preceding content with a blank line only when that content is non-empty, and
+    every later call with a single newline; getting that wrong changes the prompt
+    the model is conditioned on."""
+    out = []
+    for position, call in enumerate(tool_calls or []):
+        if not isinstance(call, dict):
+            raise APIError(400, "Each tool call must be an object.",
+                           f"messages.{index}.tool_calls.{position}")
+        fn = call.get("function", call)
+        if not isinstance(fn, dict):
+            raise APIError(400, "`function` must be an object.",
+                           f"messages.{index}.tool_calls.{position}.function")
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            raise APIError(400, "`function.name` must be a non-empty string.",
+                           f"messages.{index}.tool_calls.{position}.function.name")
+        lead = ("\n\n" if has_content else "") if position == 0 else "\n"
+        out.append(f"{lead}<tool_call>\n<function={name}>\n")
+        args = fn.get("arguments", "")
+        if isinstance(args, str) and args:
+            try:
+                args = json.loads(args)
+            except (TypeError, ValueError):
+                raise APIError(400, "`function.arguments` must be a JSON object.",
+                               f"messages.{index}.tool_calls.{position}.function.arguments")
+        if isinstance(args, dict):
+            for key, value in args.items():
+                # The template stringifies a str as-is and tojson's everything
+                # else, so a string argument must NOT gain quotes here.
+                rendered = value if isinstance(value, str) else json.dumps(
+                    value, ensure_ascii=False, separators=(", ", ": "))
+                out.append(f"<parameter={key}>\n{rendered}\n</parameter>\n")
+        out.append("</function>\n</tool_call>")
+    return "".join(out)
+
+
+QWEN38_CALL_RE = re.compile(
+    r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)</function>\s*</tool_call>", re.S)
+QWEN38_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
+
+
+def parse_qwen38_tool_calls(reply, tools=None):
+    """Parse Qwen3.8's XML-ish calls back into OpenAI `tool_calls`.
+
+    Values are returned as strings, which is what the template feeds in: it
+    writes a str argument unquoted, so the original type is not recoverable from
+    the text alone. Where the declared schema says a parameter is not a string we
+    re-read it as JSON, which restores numbers and booleans without guessing at
+    anything the schema did not promise."""
+    schema = {}
+    for tool in (tools or []):
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        params = (fn.get("parameters") or {}).get("properties") or {}
+        if isinstance(params, dict):
+            schema[fn.get("name")] = params
+    calls = []
+    for match in QWEN38_CALL_RE.finditer(reply or ""):
+        name = match.group(1).strip()
+        args = {}
+        for key, raw in QWEN38_PARAM_RE.findall(match.group(2)):
+            key = key.strip()
+            declared = (schema.get(name) or {}).get(key) or {}
+            kind = declared.get("type") if isinstance(declared, dict) else None
+            if kind in (None, "string"):
+                args[key] = raw
+            else:
+                try:
+                    args[key] = json.loads(raw)
+                except (TypeError, ValueError):
+                    args[key] = raw
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": name,
+                         "arguments": json.dumps(args, ensure_ascii=False)},
+        })
+    text = QWEN38_CALL_RE.sub("", reply or "")
+    if not calls and tools and "<tool_call>" in (reply or ""):
+        sys.stderr.write("[api] qwen38 tool markers present but no call parsed -- "
+                         "possibly truncated or mangled output\n")
+        sys.stderr.flush()
+    return text.strip(), calls
+
+
+def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, tools=None,
+                       tool_choice=None):
+    """Text-only Qwen3.8 chat-template subset with native reasoning hints."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tool_choice in ("none",):
+        tools = None                              # the client forbade them: do not offer any
+    if tools is not None and not isinstance(tools, list):
+        raise APIError(400, "`tools` must be an array.", "tools")
+
+    instruction = ""
+    if enable_thinking:
+        effort = reasoning_effort or "xhigh"
+        if effort == "high":
+            effort = "xhigh"
+        elif effort == "minimal":
+            effort = "low"
+        if effort not in ("xhigh", "medium", "low"):
+            raise APIError(400, "Qwen3.8 reasoning_effort must be high, xhigh, medium, or low.",
+                           "reasoning_effort")
+        if effort == "xhigh":
+            instruction = ("Reasoning effort is set to xhigh. Please think carefully through "
+                           "the task, validate key assumptions, consider plausible "
+                           "alternatives, and prioritize correctness, consistency, and "
+                           "clarity in the final answer.")
+        elif effort == "low":
+            instruction = ("Reasoning effort is set to low. Keep your thinking brief and "
+                           "focused, moving directly to the conclusion without unnecessary "
+                           "elaboration.")
+
+    parts = []
+    first = messages[0]
+    first_role = first.get("role") if isinstance(first, dict) else None
+    if first_role == "developer":
+        first_role = "system"
+    system_text = ""
+    start = 0
+    if first_role == "system":
+        raw = first.get("content")
+        system_text = content_text(raw, "messages.0.content").strip() if raw is not None else ""
+        start = 1
+    if tools:
+        # With tools the template builds ONE system turn in a fixed order:
+        # reasoning instruction, then the tool block, then the user's own system
+        # text last -- not the other way round.
+        head = (instruction + "\n\n") if instruction else ""
+        block = head + _qwen38_tool_block(tools)
+        if system_text:
+            block += "\n\n" + system_text
+        parts.append(f"<|im_start|>system\n{block}<|im_end|>\n")
+    elif system_text or instruction:
+        text = system_text
+        if instruction:
+            text = instruction + ("\n\n" + text if text else "")
+        parts.append(f"<|im_start|>system\n{text}<|im_end|>\n")
+
+    for index, message in enumerate(messages[start:], start=start):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role == "developer":
+            role = "system"
+        if role not in ("system", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        if role == "system" and index != 0:
+            raise APIError(400, "System message must be at the beginning.",
+                           f"messages.{index}.role")
+        raw = message.get("content")
+        text = (content_text(raw, f"messages.{index}.content").strip()
+                if raw is not None else "")
+        if role == "tool":
+            # Consecutive tool results share ONE user turn: the opening tag is
+            # written only when the previous message was not a tool, and the
+            # closing one only when the next is not. Emitting a turn per result
+            # would be a different conversation shape.
+            prev = messages[index - 1].get("role") if index > 0 and isinstance(
+                messages[index - 1], dict) else None
+            nxt = messages[index + 1].get("role") if index + 1 < len(messages) and isinstance(
+                messages[index + 1], dict) else None
+            if prev != "tool":
+                parts.append("<|im_start|>user")
+            parts.append(f"\n<tool_response>\n{text}\n</tool_response>")
+            if nxt != "tool":
+                parts.append("<|im_end|>\n")
+            continue
+        if role == "assistant":
+            reasoning = message.get("reasoning_content", "")
+            if not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            calls = message.get("tool_calls")
+            rendered = f"<think>\n{reasoning.strip()}\n</think>\n\n{text}"
+            if calls:
+                rendered += _qwen38_tool_calls(calls, bool(text.strip()), index)
+            parts.append(f"<|im_start|>assistant\n{rendered}<|im_end|>\n")
+            continue
+        parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
+
+    parts.append("<|im_start|>assistant\n")
+    parts.append("<think>\n" if enable_thinking else "<think>\n\n</think>\n\n")
+    return "".join(parts)
+
+
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                         tool_choice=None, audio_out=None):
     """Text-only subset of Inkling's chat_template.jinja: role tokens with
@@ -1365,15 +1627,566 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     return "".join(prompt)
 
 
+# ---- immagini per GLM-5.3 ------------------------------------------------------------
+# Il modello vede l'immagine come una sequenza di segnaposto <|image|>, uno per
+# token che la torre produrra': (griglia_h/2) x (griglia_w/2). Il numero non e'
+# negoziabile -- il motore rifiuta se non combacia con gli embedding che riceve --
+# quindi si preprocessa PRIMA di rendere il prompt e si espande il segnaposto al
+# numero giusto. Cosi' il renderer non deve sapere niente di immagini.
+GLM53_IMAGE_OPEN, GLM53_IMAGE, GLM53_IMAGE_CLOSE = (
+    "<|begin_of_image|>", "<|image|>", "<|end_of_image|>")
+
+
+def _image_bytes_from_url(url):
+    """data: URI, file:// o percorso sul disco -> i byte dell'immagine.
+
+    A local path is read with the server process's own permissions. On a
+    server that binds beyond loopback (which already requires an API key),
+    an authenticated client could otherwise read any file the process can
+    reach -- e.g. "file:///etc/passwd". Two guards without breaking the
+    documented loopback single-user case: '..' is refused outright (never
+    needed for a real image path), and if COLI_IMAGE_ROOT is set the resolved
+    path must stay inside it, mirroring serve_static's relative_to() check.
+    Errors stay generic so the reply never confirms a path or its permissions."""
+    if not isinstance(url, str) or not url:
+        raise APIError(400, "image_url.url must be a non-empty string.", "messages")
+    if url.startswith("data:"):
+        head, _, payload = url.partition(",")
+        if "base64" not in head:
+            raise APIError(400, "only base64 data: URIs are supported.", "messages")
+        import base64
+        try:
+            return base64.b64decode(payload, validate=True)
+        except Exception:
+            raise APIError(400, "image_url.url is not valid base64.", "messages")
+    if url.startswith("http://") or url.startswith("https://"):
+        # Scaricare da un URL che arriva in una richiesta vorrebbe dire far fare
+        # al server una chiamata di rete decisa da chi la manda. Non si fa.
+        raise APIError(400, "remote image URLs are not fetched; send the image "
+                            "as a base64 data: URI or a path on this machine.",
+                       "messages")
+    raw = url[7:] if url.startswith("file://") else url
+    if ".." in Path(raw).parts:
+        raise APIError(400, "image path is not allowed.", "messages")
+    try:
+        target = Path(raw).resolve()
+        image_root = os.environ.get("COLI_IMAGE_ROOT")
+        if image_root:
+            target.relative_to(Path(image_root).resolve())
+    except (ValueError, OSError):
+        raise APIError(400, "image path is not allowed.", "messages")
+    try:
+        with open(target, "rb") as handle:
+            return handle.read()
+    except OSError:
+        raise APIError(400, "cannot read the requested image.", "messages")
+
+
+# Qwen3.8 splices images as <|vision_start|> + N x <|image_pad|> + <|vision_end|>,
+# and N is not a constant: the resolution is dynamic, so it comes from the grid
+# the preprocessor chose. Hardcoding it would put the right vectors in the wrong
+# number of slots, which the engine refuses rather than guesses about.
+QWEN38_VISION_START = "<|vision_start|>"
+QWEN38_IMAGE_PAD = "<|image_pad|>"
+QWEN38_VISION_END = "<|vision_end|>"
+
+
+def _preprocess_qwen38_image(data, model_dir, max_tokens=None):
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
+        from qwen38_image import preprocess
+    except ImportError as problem:
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+                       "messages")
+    return preprocess(data, model_dir, max_tokens)
+
+
+def expand_qwen38_images(messages, model_dir, max_tokens=None):
+    """Replace image parts with their placeholders and pull out the patches.
+
+    Returns (rewritten messages, images). The messages come back as plain text,
+    so the renderer treats them like any other turn."""
+    images = []
+    rewritten = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            rewritten.append(message)
+            continue
+        pieces = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "text":
+                pieces.append(part.get("text", ""))
+            elif kind in ("image_url", "input_image"):
+                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
+                      else part.get("image_url") or part.get("url")
+                data = _image_bytes_from_url(url)
+                patches, grid_h, grid_w = _preprocess_qwen38_image(
+                    data, model_dir, max_tokens)
+                tokens = (grid_h // 2) * (grid_w // 2)
+                images.append((patches, grid_h, grid_w))
+                pieces.append(QWEN38_VISION_START + QWEN38_IMAGE_PAD * tokens
+                              + QWEN38_VISION_END)
+            else:
+                raise APIError(400, f"unsupported content part {kind!r}.", "messages")
+        rewritten.append({**message, "content": "".join(pieces)})
+    return rewritten, images
+
+
+def expand_glm53_images(messages, model_dir):
+    """Sostituisce le parti immagine coi loro segnaposto e ne estrae le patch.
+
+    Restituisce (messaggi riscritti, patch). I messaggi tornano con contenuto
+    testuale puro, quindi il renderer li tratta come qualunque altro turno."""
+    images = []
+    rewritten = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            rewritten.append(message)
+            continue
+        pieces = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "text":
+                pieces.append(part.get("text", ""))
+            elif kind in ("image_url", "input_image"):
+                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
+                      else part.get("image_url") or part.get("url")
+                data = _image_bytes_from_url(url)
+                patches, grid_h, grid_w = _preprocess_image(data, model_dir)
+                tokens = (grid_h // 2) * (grid_w // 2)
+                images.append((patches, grid_h, grid_w))
+                pieces.append(GLM53_IMAGE_OPEN + GLM53_IMAGE * tokens + GLM53_IMAGE_CLOSE)
+            else:
+                raise APIError(400, f"unsupported content part {kind!r}.", "messages")
+        rewritten.append({**message, "content": "".join(pieces)})
+    return rewritten, images
+
+
+# DeepSeek V4.1's image placeholder: every position of an image span carries the same
+# id, and what each one MEANS follows from the aligner grid (image_processor.py
+# image_token_types): start, then one newline per row of image tokens, then end. The
+# engine rebuilds that layout from the grid it gets in the IMAGE frame, so the gateway
+# only has to insert the right NUMBER of placeholders -- and getting that number wrong
+# is the one failure the engine cannot paper over, which is why it refuses instead.
+DSV41_IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
+
+
+def expand_dsv41_images(messages, model_dir, max_tokens=None):
+    """Replace image parts with their placeholder span and pull out the patches."""
+    images, rewritten = [], []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            rewritten.append(message)
+            continue
+        pieces = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "text":
+                pieces.append(part.get("text", ""))
+            elif kind in ("image_url", "input_image"):
+                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
+                      else part.get("image_url") or part.get("url")
+                data = _image_bytes_from_url(url)
+                patches, grid_h, grid_w, llm_h, llm_w = _preprocess_dsv41_image(
+                    data, model_dir, max_tokens)
+                span = 1 + (llm_w + 1) * llm_h + 1
+                images.append((patches, grid_h, grid_w))
+                pieces.append(DSV41_IMAGE_PLACEHOLDER * span)
+            else:
+                raise APIError(400, f"unsupported content part {kind!r}.", "messages")
+        rewritten.append({**message, "content": "".join(pieces)})
+    return rewritten, images
+
+
+def _preprocess_dsv41_image(data, model_dir, max_tokens=None):
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
+        from dsv41_image import preprocess
+    except ImportError as problem:
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+                       "messages")
+    return preprocess(data, model_dir, max_tokens)
+
+
+def _preprocess_image(data, model_dir):
+    """L'immagine nelle patch che la torre vuole. Il lavoro sta in
+    tools/glm53_image.py, verificato contro il processore ufficiale."""
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
+        from glm53_image import preprocess
+    except ImportError as problem:
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+                       "messages")
+    return preprocess(data, model_dir)
+
+
+GLM53_TOOL_PREAMBLE = (
+    "<|system|>\n# Tools\n\n"
+    "You may call one or more functions to assist with the user query.\n\n"
+    "You are provided with function signatures within <tools></tools> XML tags:\n"
+    "<tools>\n")
+GLM53_TOOL_EPILOGUE = (
+    "\n</tools>\n\n"
+    "For each function call, output the function name and arguments within the "
+    "following XML format:\n"
+    "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>"
+    "<arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key>"
+    "<arg_value>{arg-value-2}</arg_value>...</tool_call>")
+
+
+def _glm53_tool_json(tool):
+    """Una firma di strumento come la serializza il template di GLM-5.3.
+
+    Le chiavi restano nell'ordine in cui il client le ha mandate, perche' il
+    template itera `tool.items()` e non le riordina; `defer_loading` e `strict`
+    non entrano nel prompt."""
+    if isinstance(tool, dict) and "function" in tool:
+        tool = tool["function"]
+    if not isinstance(tool, dict):
+        raise APIError(400, "each tool must be an object.", "tools")
+    parts = [f'"{key}": {json.dumps(value, ensure_ascii=False)}'
+             for key, value in tool.items()
+             if key not in ("defer_loading", "strict")]
+    return "{" + ", ".join(parts) + "}"
+
+
+def _glm53_tool_block(tools):
+    """Il blocco di dichiarazione, spaziatura compresa.
+
+    Gli a capo non sono decorativi: sono quelli che escono da chat_template.jinja
+    e il test li confronta byte a byte contro jinja2, perche' un prompt che
+    somiglia a quello dell'addestramento non e' quello dell'addestramento."""
+    body = "".join(f"\n{_glm53_tool_json(tool)}\n\n"
+                   for tool in tools
+                   if not (isinstance(tool, dict)
+                           and (tool.get("function", tool) or {}).get("defer_loading")))
+    return GLM53_TOOL_PREAMBLE + body + GLM53_TOOL_EPILOGUE
+
+
+def _glm53_tool_calls(calls):
+    """Le chiamate di un turno assistente passato, nel formato che il modello
+    stesso produce: <tool_call>nome<arg_key>k</arg_key><arg_value>v</arg_value>.
+    Le stringhe passano cosi' come sono, il resto come JSON."""
+    out = []
+    for call in calls or []:
+        if isinstance(call, dict) and "function" in call:
+            call = call["function"]
+        name = (call or {}).get("name", "")
+        arguments = (call or {}).get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except ValueError:
+                arguments = {}
+        pieces = [f"<tool_call>{name}"]
+        for key, value in (arguments or {}).items():
+            rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            pieces.append(f"<arg_key>{key}</arg_key><arg_value>{rendered}</arg_value>")
+        pieces.append("</tool_call>")
+        out.append("".join(pieces))
+    return "\n" + "".join(out) + "\n" if out else ""
+
+
+def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                      tool_choice=None):
+    """Render the text-only subset of the official GLM-5.3-Flash chat template.
+
+    Not a variant of the GLM-5.2 renderer above, and the differences are not
+    cosmetic. GLM-5.3 emits the reasoning-effort system line ALWAYS, because its
+    template defaults the effort to Max rather than leaving it unset; it accepts
+    only low, high and max, not the six-level ladder; its generation prompt
+    OPENS the reasoning block with a bare `<think>` where 5.2 closed it
+    immediately; and it declares tools with its own preamble and spacing.
+
+    What the two share is how a call comes BACK: both models emit
+    `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`,
+    so the existing parser needs nothing added for this family.
+
+    The whole thing is pinned byte for byte against chat_template.jinja rendered
+    with jinja2 (tests/test_glm53_chat_template.py). Getting the prompt nearly
+    right is the failure mode worth guarding: the model answers either way.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name")
+                  or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None                              # il client li ha vietati: non si offrono
+
+    prompt = ["[gMASK]<sop>"]
+    # La riga di effort esce SEMPRE, come nel template: `effective_reasoning_effort`
+    # ha un ramo else che vale 'max', quindi non e' mai none. GLM-5.3 non ha un modo
+    # "non ragionare" -- in questo template `enable_thinking` non esiste proprio, e
+    # il prompt di generazione APRE sempre <think>.
+    #
+    # Quindi enable_thinking=False qui non puo' voler dire "spegni": vuol dire "il
+    # minimo che il modello supporta", cioe' Low. Il ragionamento avviene comunque;
+    # a nasconderlo e' il gateway, non il prompt.
+    #
+    # La forma che questo sostituisce -- nessuna riga di effort e <think></think>
+    # chiuso -- non esiste nel template e il modello non l'ha mai vista: e' la causa
+    # di #1278. Meta' di quella deviazione l'ho aggiunta io in #1282, giustificandola
+    # con un meccanismo poi misurato falso e ritirato pubblicamente sulla issue.
+    # Reso il template con jinja2 accanto a questo renderer, l'unica forma che sa
+    # produrre e':
+    #     [gMASK]<sop><|system|>Reasoning Effort: {Low|High|Max}<|user|>..<|assistant|><think>
+    #
+    # low e high passano, tutto il resto e' Max: e' la scala del template, non la
+    # nostra. `none` non arriva qui, spegne il ragionamento a monte per le famiglie
+    # che possono davvero spegnerlo.
+    effort = {"minimal": "Low", "low": "Low", "medium": "High",
+              "high": "High", "xhigh": "Max"}.get(reasoning_effort,
+                                                  "Max" if enable_thinking else "Low")
+    prompt.append(f"<|system|>Reasoning Effort: {effort}")
+    if tools:
+        prompt.append(_glm53_tool_block(tools))
+
+    for message in messages:
+        if not isinstance(message, dict):
+            raise APIError(400, "each message must be an object.", "messages")
+        role = message.get("role")
+        content = message.get("content")
+        if isinstance(content, list):                 # parti multimodali: solo il testo
+            content = "".join(part.get("text", "") for part in content
+                              if isinstance(part, dict) and part.get("type") == "text")
+        content = content or ""
+        if role == "user":
+            prompt.append(f"<|user|>{content}")
+        elif role == "system":
+            prompt.append(f"<|system|>{content}")
+        elif role == "tool":
+            prompt.append(f"<|observation|><tool_response>{content}</tool_response>")
+        elif role == "assistant":
+            reasoning = message.get("reasoning_content")
+            if not isinstance(reasoning, str) and "</think>" in content:
+                reasoning = content.split("</think>")[0].split("<think>")[-1]
+                content = content.split("</think>")[-1]
+            opened = f"<think>{reasoning}</think>" if isinstance(reasoning, str) else "<think></think>"
+            prompt.append(f"<|assistant|>{opened}{content.strip()}"
+                          f"{_glm53_tool_calls(message.get('tool_calls'))}")
+        else:
+            raise APIError(400, f"unsupported message role {role!r}.", "messages")
+
+    # Il prompt di generazione apre il blocco, sempre, come il template:
+    #     {%- if add_generation_prompt -%}<|assistant|>{{- '<think>' -}}{%- endif -%}
+    # Il vecchio commento qui sosteneva che <think></think> chiuso fosse "uno stato
+    # su cui il modello e' addestrato" perche' il template lo scrive davanti a un
+    # TURNO PASSATO senza ragionamento. E' vero per un turno passato e falso per il
+    # prompt di generazione: la posizione da cui il modello scrive non e' mai quella.
+    prompt.append("<|assistant|><think>")
+    return "".join(prompt)
+
+
+# ---- DeepSeek V4.1 Flash -----------------------------------------------------------------
+# The checkpoint ships its chat format as a Python module (encoding/encoding.py), not a
+# jinja template, so this is that module's render_message transcribed for the shapes the
+# gateway sends. Its pieces, with the vendor's own names:
+#
+#   <｜begin▁of▁sentence｜>  once, at the head of a fresh conversation
+#   <｜System｜>             leads the conversation when there is a system message or a
+#                           reasoning-effort line; also precedes a mid-conversation one
+#   Reasoning Effort: N     index 0 only, thinking mode only, N in 1..100
+#   <｜User｜> / <｜Assistant｜>
+#   <think> or </think>     the generation cue: open in thinking mode, closed otherwise
+#   assistant turns end with <｜end▁of▁sentence｜>
+#
+# Two details the reference hides in its control flow, both reproduced below. First,
+# <think> and </think> straddle a turn boundary: the OPENING token is the transition the
+# reference appends after a user turn, the CLOSING one belongs to the assistant turn that
+# follows, so an assistant turn always starts with one or the other and there is no such
+# thing as a past assistant turn without a </think>. Second, the reference drops the
+# reasoning of turns before the last user message -- except when the conversation declares
+# tools, where it keeps every one of them (`if any(m.get("tools") ...)`), because a tool
+# call is only interpretable next to the reasoning that produced it.
+DSV41_BOS = "<｜begin▁of▁sentence｜>"
+DSV41_EOS = "<｜end▁of▁sentence｜>"
+DSV41_SYSTEM = "<｜System｜>"
+DSV41_USER = "<｜User｜>"
+DSV41_ASSISTANT = "<｜Assistant｜>"
+# encoding.py REASONING_EFFORT_MAPPINGS; the default there is "high"
+DSV41_EFFORT = {"minimal": 50, "low": 50, "medium": 75, "high": 75, "xhigh": 100}
+
+
+def _dsv41_tools_block(tools):
+    """V4.1 tool-declaration block, rendered by the vendored reference template."""
+    schemas = []
+    for tool in (tools or []):
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        # Gateway-side scrub: OpenAI clients attach routing hints the model
+        # schema must not carry.
+        clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
+        if isinstance(tool, dict) and tool.get("namespace") is not None:
+            clean = dict(clean, namespace=tool["namespace"])
+        schemas.append(clean)
+    return v41_dsml.render_tools(v41_dsml.tools_from_openai_format(schemas))
+
+
+def _dsv41_merge_turns(messages):
+    """encoding.py merge_tool_messages + sort_tool_results_by_call_order.
+
+    V4.1 has no standalone tool role: a tool result is a <tool_result> block inside the
+    NEXT user turn, and consecutive user-side messages collapse into one turn joined by
+    a blank line. Returns turns of {"role", "parts"/"content", ...}, validating each
+    original message so field-level errors keep pointing at the client's own indices.
+    """
+    turns = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role == "developer":
+            role = "system"
+        if role not in ("system", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role == "assistant":
+            reasoning = message.get("reasoning_content")
+            if reasoning is not None and not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            turns.append({"role": "assistant", "content": text,
+                          "reasoning_content": reasoning,
+                          "tool_calls": message.get("tool_calls")})
+        elif role in ("user", "tool"):
+            block = ({"kind": "tool_result", "id": message.get("tool_call_id") or "",
+                      "text": v41_dsml.render_tool_result(text)} if role == "tool"
+                     else {"kind": "text", "id": "", "text": text})
+            if turns and turns[-1]["role"] == "user":
+                turns[-1]["parts"].append(block)
+            else:
+                turns.append({"role": "user", "parts": [block]})
+        else:
+            turns.append({"role": "system", "content": text})
+    # A parallel-call round trip arrives in whatever order the client's tools finished;
+    # the model reads them positionally, so restore the order it called them in.
+    order = {}
+    for turn in turns:
+        if turn["role"] == "assistant" and turn.get("tool_calls"):
+            order = {}
+            for at, call in enumerate(turn["tool_calls"]):
+                identifier = call.get("id") if isinstance(call, dict) else None
+                if identifier:
+                    order[identifier] = at
+        elif turn["role"] == "user" and order:
+            results = [p for p in turn["parts"] if p["kind"] == "tool_result"]
+            if len(results) > 1:
+                results.sort(key=lambda p: order.get(p["id"], 0))
+                feed = iter(results)
+                turn["parts"] = [next(feed) if p["kind"] == "tool_result" else p
+                                 for p in turn["parts"]]
+    return turns
+
+
+def render_chat_dsv41(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                      tool_choice=None):
+    """encoding.py _encode_messages_text for one turn.
+
+    Tool use follows the checkpoint's own DSML format (encoding/encoding.py, vendored in
+    v41_dsml.py): schemas are declared at the end of the system message, assistant tool
+    calls are <｜DSML｜ calls> blocks, and tool results are <tool_result> blocks merged
+    into the following user turn.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name")
+                  or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None                              # the client forbade tools: do not offer them
+    turns = _dsv41_merge_turns(messages)
+    if tools:
+        tools_text = _dsv41_tools_block(tools)
+        if forced:
+            tools_text += f"\n\nYou must call the function `{forced}`. Do not answer directly."
+        elif tool_choice == "required":
+            tools_text += "\n\nYou must call one of the functions above. Do not answer directly."
+        for turn in turns:
+            if turn["role"] == "system":
+                turn["content"] += "\n\n" + tools_text
+                break
+        else:
+            # No system message: the reference renders tools on an empty one, so the block
+            # arrives as <｜System｜> + "\n\n" + tools. Keep that exact byte layout.
+            turns.insert(0, {"role": "system", "content": "\n\n" + tools_text})
+    budget = DSV41_EFFORT.get(reasoning_effort or "high", 75)
+    effort = (f"Reasoning Effort: {budget} (range 1-100, the higher the value, the more "
+              f"thorough the reasoning)\n\n") if enable_thinking else ""
+    # find_last_user_index: a mid-conversation system message counts as a user turn,
+    # because it is one of the two things the reference puts an assistant header after.
+    last_user = -1
+    for index, turn in enumerate(turns):
+        if turn["role"] == "user" or (turn["role"] == "system" and index > 0):
+            last_user = index
+    # With tools on the table the reference keeps every turn's reasoning; without them it
+    # drops the reasoning of everything before the last user message.
+    drop_thinking = not tools
+    prompt = [DSV41_BOS]
+    for index, turn in enumerate(turns):
+        role = turn["role"]
+        if role == "system":
+            prompt.append(DSV41_SYSTEM)
+            if index == 0:
+                prompt.append(effort)
+            prompt.append(turn["content"])
+        elif role == "user":
+            if index == 0 and effort:
+                prompt.append(DSV41_SYSTEM + effort)
+            prompt.append(DSV41_USER)
+            prompt.append("\n\n".join(part["text"] for part in turn["parts"]))
+        else:
+            keep = enable_thinking and (not drop_thinking or index > last_user)
+            prompt.append(DSV41_ASSISTANT)
+            prompt.append(f"<think>{turn.get('reasoning_content') or ''}</think>"
+                          if keep else "</think>")
+            prompt.append(turn["content"])
+            if turn.get("tool_calls"):
+                prompt.append(v41_dsml.render_tool_calls(turn["tool_calls"]))
+            prompt.append(DSV41_EOS)
+    # the generation cue, exactly as render_message appends it after a user turn
+    prompt.append(DSV41_ASSISTANT)
+    prompt.append("<think>" if enable_thinking and len(turns) - 1 >= last_user else "</think>")
+    return "".join(prompt)
+
+
 def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                          tool_choice=None, audio_out=None):
     """Render a chat request with the active engine's native prompt contract."""
     if ARCH == "inkling":
         return render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
                                     tool_choice, audio_out=audio_out)
-    renderer = (render_chat_kimi if ARCH == "kimi" else
+    renderer = (render_chat_glm53 if ARCH == "glm53" else
+                render_chat_kimi if ARCH == "kimi" else
                 render_chat_qwen if ARCH == "qwen36" else
+                render_chat_qwen38 if ARCH == "qwen38" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
+                render_chat_dsv41 if ARCH == "deepseek_v41" else
                 render_chat_olmoe if ARCH == "olmoe" else render_chat)
     return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
 
@@ -1385,6 +2198,23 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
 # translation and the response/SSE shapes are new. Claude Code is the reference client.
 
 ANTHROPIC_LOCAL_SIGNATURE = "colibri-local"  # opaque compatibility metadata, not a crypto proof
+
+
+def starts_in_reasoning(enable_thinking):
+    """Se l'uscita del modello comincia DENTRO al blocco di ragionamento.
+
+    Dipende da come il prompt lo ha lasciato, e ogni famiglia lo lascia come
+    dice il suo interruttore: acceso apre il blocco e il modello lo chiude da
+    solo, spento lo chiude gia' il prompt e quello che torna e' risposta pura.
+    Se le due cose non concordano il ragionamento finisce incollato davanti
+    alla risposta, che e' il difetto che questa funzione esiste per non avere.
+
+    GLM-5.3 e' l'eccezione che rende la regola esplicita: il suo template non
+    ha un interruttore, render_chat_glm53 apre <think> SEMPRE, e "thinking
+    spento" vuol dire solo effort Low. L'uscita comincia dentro al blocco in
+    ogni caso; partire in modalita' testo perche' il client ha detto False e'
+    esattamente il ragionamento incollato davanti alla risposta di #1278."""
+    return enable_thinking or ARCH == "glm53"
 
 
 class ThinkingStreamSplit:
@@ -1440,7 +2270,7 @@ class ThinkingStreamSplit:
 def split_thinking_reply(text, enable_thinking=True):
     """Return the marker-free (thinking, answer) portions of one GLM reply."""
     thinking, answer = [], []
-    split = ThinkingStreamSplit(thinking.append, answer.append, initial_thinking=enable_thinking)
+    split = ThinkingStreamSplit(thinking.append, answer.append, initial_thinking=starts_in_reasoning(enable_thinking))
     split.feed(text)
     split.finish()
     return "".join(thinking), "".join(answer)
@@ -1748,6 +2578,30 @@ class StopFilter:
     def stopped(self):
         return self.matched is not None
 
+
+class ToolSideband:
+    """Request-scoped K3 TOOL frames with the same stop policy as DATA."""
+    def __init__(self, enabled, sequences, ignore_leading=False):
+        self.enabled = enabled
+        self.seen = False
+        self.parts = []
+        self.filter = (StopFilter(sequences, self.parts.append, ignore_leading)
+                       if enabled else None)
+
+    def feed(self, chunk):
+        self.seen = True
+        self.filter.feed(chunk)
+
+    def stopped(self):
+        return bool(self.filter and self.filter.stopped())
+
+    def finish(self):
+        if self.filter:
+            self.filter.finish()
+
+    def reply(self):
+        return "".join(self.parts) if self.seen else None
+
 def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
@@ -1938,6 +2792,12 @@ def cap_for_arch(arch, cap, env=None):
             measured = 0
         if measured >= 1:
             return measured
+        try:
+            planned = int(env.get("COLI_PLAN_CAP", ""))
+        except (TypeError, ValueError):
+            planned = 0
+        if planned >= 1:
+            return planned
     return family_by_id(arch).limits.implicit_cap
 
 
@@ -2073,11 +2933,14 @@ class Engine:
             family = (resolve_model(model).descriptor if config.exists()
                       else family_by_id(ARCH))
         arch = family.id
+        self.family = family
+        self.model_dir = str(model)
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
         resolved_cap = cap_for_arch(arch, cap, child_env)
         child_env.pop("COLI_PROFILE_CAP", None)
+        child_env.pop("COLI_PLAN_CAP", None)
         self.process = subprocess.Popen(
             [str(executable), str(resolved_cap)], env=child_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
@@ -2169,6 +3032,21 @@ class Engine:
                         events = self.pending.get(request_id)
                     if events is not None:
                         events.put(("data", data))
+                elif kind == "TOOL" and len(fields) == 3:
+                    # Opaque, request-scoped structured output. K3 emits an
+                    # initial zero-byte frame before generation so DATA marker
+                    # lookalikes can never be mistaken for engine structure.
+                    request_id = fields[1]
+                    size = int(fields[2])
+                    if not 0 <= size <= 65536:
+                        raise RuntimeError("invalid engine TOOL size")
+                    data = self._read_exact(size)
+                    if self._read_exact(1) != b"\n":
+                        raise RuntimeError("invalid engine TOOL terminator")
+                    with self.pending_lock:
+                        events = self.pending.get(request_id)
+                    if events is not None:
+                        events.put(("tool", data))
                 elif kind == "ECHO" and len(fields) >= 6:
                     # U7a prefill read-out: "ECHO <id> <n> <pos> <lp> <k>
                     # [tid tlp]*k" plus a DATA-framed payload (n bytes + LF).
@@ -2243,7 +3121,8 @@ class Engine:
                 self._fail_pending(error)
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
+                 on_tool=None, image=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -2259,11 +3138,19 @@ class Engine:
         if gpayload and apayload:
             raise APIError(400, "Grammar and audio cannot be combined.", "response_format")
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        tool_decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
         def decode(data):
             text = decoder.decode(data)
             if text:
                 on_text(text)
+
+        def decode_tool(data):
+            text = tool_decoder.decode(data)
+            if on_tool is not None:
+                # Call on zero-byte frames too: that frame declares this
+                # request's sideband authoritative even when no call follows.
+                on_tool(text)
 
         events = queue.Queue()
         with self.pending_lock:
@@ -2300,6 +3187,16 @@ class Engine:
             with self.write_lock:
                 if self.process.poll() is not None:
                     raise RuntimeError("colibri engine is not running")
+                # Le patch sono binarie e grosse: viaggiano in un frame loro,
+                # annunciato subito prima del SUBMIT a cui appartengono. Deve
+                # partire dentro lo stesso lock, o un'altra richiesta potrebbe
+                # infilarsi in mezzo e prendersi l'immagine di questa.
+                if image is not None:
+                    patches, grid_h, grid_w = image
+                    blob = patches.tobytes() if hasattr(patches, "tobytes") else patches
+                    self.process.stdin.write(
+                        f"IMAGE {request_id} {len(blob)} {grid_h} {grid_w}\n".encode()
+                        + blob + b"\n")
                 self.process.stdin.write(header + payload + xpayload + b"\n")
                 self.process.stdin.flush()
         except Exception:
@@ -2366,6 +3263,20 @@ class Engine:
                         with self.write_lock:
                             self.process.stdin.write(f"CANCEL {request_id}\n".encode())
                             self.process.stdin.flush()
+            elif kind == "tool":
+                _accept({"prompt_tokens": None})
+                if not cancel_sent and not stop_sent:
+                    decode_tool(value)
+                    if stopped and stopped():
+                        stop_sent = True
+                        with self.write_lock:
+                            self.process.stdin.write(f"STOP {request_id}\n".encode())
+                            self.process.stdin.flush()
+                    elif cancelled and cancelled():
+                        cancel_sent = True
+                        with self.write_lock:
+                            self.process.stdin.write(f"CANCEL {request_id}\n".encode())
+                            self.process.stdin.flush()
             elif kind == "done":
                 _accept({"prompt_tokens": None})
                 if cancel_sent:
@@ -2377,6 +3288,9 @@ class Engine:
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     on_text(tail)
+                tool_tail = tool_decoder.decode(b"", final=True)
+                if tool_tail and on_tool is not None:
+                    on_tool(tool_tail)
                 return value
             elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
                 raise ClientCancelled()
@@ -2914,7 +3828,7 @@ class APIHandler(BaseHTTPRequestHandler):
         return {"type": "error", "error": {"type": error.error_type, "message": error.message}}
 
     def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
-                   enable_thinking=False, audio=None):
+                   enable_thinking=False, audio=None, image=None):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
         # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
         # tool results into `prompt`, so level 2 is the full conversation the engine saw.
@@ -2968,11 +3882,20 @@ class APIHandler(BaseHTTPRequestHandler):
             if not stream:
                 output = []
                 stop_filter = StopFilter(stop_sequences, output.append, ignore_leading_stop)
+                sideband = ToolSideband(ARCH == "kimi" and chat and bool(tools),
+                                        stop_sequences, ignore_leading_stop)
+
+                def generation_stopped():
+                    return stop_filter.stopped() or sideband.stopped()
+
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
-                    **({"audio": audio} if audio else {}))
+                    self.client_disconnected, grammar=grammar, stopped=generation_stopped,
+                    **({"on_tool": sideband.feed} if sideband.enabled else {}),
+                    **({"audio": audio} if audio else {}),
+                    **({"image": image} if image is not None else {}))
                 stop_filter.finish()
+                sideband.finish()
                 text = "".join(output)
                 reasoning = ""
                 if ARCH == "inkling":
@@ -2984,7 +3907,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning, text = split_thinking_reply(text, enable_thinking)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
-                    content, calls = parse_arch_tool_calls(text, tools)
+                    content, calls = parse_arch_tool_calls(text, tools, sideband.reply())
                     message = {"role": "assistant", "content": content or None, "refusal": None}
                     if reasoning:
                         message["reasoning_content"] = reasoning
@@ -3111,8 +4034,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 sp = {"buf": "", "tool": False}
                 hold = _tool_hold()
                 raw = []
+                sideband = ToolSideband(ARCH == "kimi", stop_sequences,
+                                        ignore_leading_stop)
+
                 def feed_content(chunk):               # answer text only (post-</think>)
                     raw.append(chunk)
+                    if sideband.seen:
+                        emit(chunk)
+                        return
                     if sp["tool"]:
                         return
                     sp["buf"] += chunk
@@ -3130,23 +4059,31 @@ class APIHandler(BaseHTTPRequestHandler):
                 # #597: keep GLM reasoning out of the tool-call buffer — a think splitter sends it
                 # to reasoning_content and passes only the answer text on to feed_content/parser.
                 think = (ThinkingStreamSplit(emit_reasoning, feed_content,
-                                             initial_thinking=enable_thinking)
+                                             initial_thinking=starts_in_reasoning(enable_thinking))
                          if glm_think else None)
                 def emit_tools(chunk):
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
                     (think.feed if think else feed_content)(chunk)
                 stop_filter = StopFilter(stop_sequences, emit_tools, ignore_leading_stop)
+
+                def generation_stopped():
+                    return stop_filter.stopped() or sideband.stopped()
+
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
-                    on_accept=start_stream, **({"audio": audio} if audio else {}))
+                    self.client_disconnected, grammar=grammar, stopped=generation_stopped,
+                    **({"on_tool": sideband.feed} if sideband.enabled else {}),
+                    on_accept=start_stream, **({"audio": audio} if audio else {}),
+                    **({"image": image} if image is not None else {}))
                 stop_filter.finish()
+                sideband.finish()
                 if think:
                     think.finish()
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
-                _content, calls = parse_arch_tool_calls("".join(raw), tools)
+                _content, calls = parse_arch_tool_calls("".join(raw), tools,
+                                                        sideband.reply())
                 for i, tc in enumerate(calls):
                     event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
                              "type": "function", "function": {"name": tc["function"]["name"],
@@ -3158,7 +4095,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     content_split = splitter
                 elif glm_think:                            # GLM <think> reasoning → reasoning_content
                     content_split = ThinkingStreamSplit(emit_reasoning, emit,
-                                                        initial_thinking=enable_thinking)
+                                                        initial_thinking=starts_in_reasoning(enable_thinking))
                 else:
                     content_split = None
                 def emit_plain(chunk):
@@ -3169,7 +4106,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
-                    on_accept=start_stream, **({"audio": audio} if audio else {}))
+                    on_accept=start_stream, **({"audio": audio} if audio else {}),
+                    **({"image": image} if image is not None else {}))
                 stop_filter.finish()
                 if content_split:
                     content_split.close()
@@ -3220,9 +4158,13 @@ class APIHandler(BaseHTTPRequestHandler):
         # COLI_THINK=1 makes thinking the default when the client sends NEITHER reasoning_effort
         # nor enable_thinking (a global switch, like the old server's --think). An explicit
         # client value always wins. Default off => exact OpenAI-standard behavior.
-        if (reasoning_effort is None and "enable_thinking" not in body
-                and os.environ.get("COLI_THINK", "0") == "1"):
-            reasoning_effort = "high"
+        if reasoning_effort is None and "enable_thinking" not in body:
+            # Qwen3.8's official template defaults to enabled xhigh thinking;
+            # preserve the older opt-in default for the other families.
+            if ARCH == "qwen38":
+                reasoning_effort = "xhigh"
+            elif os.environ.get("COLI_THINK", "0") == "1":
+                reasoning_effort = "high"
         enable_thinking = body.get("enable_thinking", reasoning_effort not in (None, "none"))
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
@@ -3238,11 +4180,42 @@ class APIHandler(BaseHTTPRequestHandler):
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
         audio_clips = [] if ARCH == "inkling" else None
-        prompt = render_chat_for_arch(body.get("messages"), enable_thinking, reasoning_effort,
+        messages = body.get("messages")
+        # Le immagini diventano segnaposto PRIMA del rendering: il renderer
+        # tratta poi turni di solo testo, e il conto dei segnaposto e quello
+        # degli embedding non possono divergere.
+        image = None
+        if ARCH == "glm53":
+            messages, images = expand_glm53_images(
+                messages, getattr(self.server.engine, "model_dir", None))
+            if len(images) > 1:
+                raise APIError(400, "one image per request for now; the engine "
+                                    "holds a single pending image.", "messages")
+            image = images[0] if images else None
+        elif ARCH == "deepseek_v41":
+            ceiling = os.environ.get("V41_MAX_IMAGE_TOKENS")
+            messages, images = expand_dsv41_images(
+                messages, getattr(self.server.engine, "model_dir", None),
+                int(ceiling) if ceiling else None)
+            if len(images) > 1:
+                raise APIError(400, "one image per request for now; the engine "
+                                    "holds a single pending image.", "messages")
+            image = images[0] if images else None
+        elif ARCH == "qwen38":
+            ceiling = os.environ.get("Q38_MAX_IMAGE_TOKENS")
+            messages, images = expand_qwen38_images(
+                messages, getattr(self.server.engine, "model_dir", None),
+                int(ceiling) if ceiling else None)
+            if len(images) > 1:
+                raise APIError(400, "one image per request for now; the engine "
+                                    "holds a single pending image.", "messages")
+            image = images[0] if images else None
+        prompt = render_chat_for_arch(messages, enable_thinking, reasoning_effort,
                                       tools, tool_choice, audio_out=audio_clips)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
                         enable_thinking=enable_thinking,
-                        audio=b"".join(audio_clips) if audio_clips else None)
+                        audio=b"".join(audio_clips) if audio_clips else None,
+                        image=image)
 
     # ---- Anthropic /v1/messages (#343) ----------------------------------------------------
     ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
@@ -3259,8 +4232,11 @@ class APIHandler(BaseHTTPRequestHandler):
         if thinking is not None and not isinstance(thinking, dict):
             raise APIError(400, "`thinking` must be an object.", "thinking")
         enable_thinking = bool(thinking and thinking.get("type") == "enabled")
-        if not enable_thinking and thinking is None and os.environ.get("COLI_THINK", "0") == "1":
-            enable_thinking = True
+        if not enable_thinking and thinking is None:
+            if ARCH == "qwen38":
+                enable_thinking = True
+            elif os.environ.get("COLI_THINK", "0") == "1":
+                enable_thinking = True
         if ARCH == "olmoe":
             enable_thinking = False   # #984: OLMoE has no thinking mode (see the OpenAI path)
         if body.get("max_tokens") is None:
@@ -3275,8 +4251,9 @@ class APIHandler(BaseHTTPRequestHandler):
             translated["tool_choice"] = tool_choice
         if tool_choice == "none":
             tools = None
+        default_effort = "xhigh" if ARCH == "qwen38" and thinking is None else "high"
         prompt = render_chat_for_arch(messages, enable_thinking,
-                                      "high" if enable_thinking else None,
+                                      default_effort if enable_thinking else None,
                                       tools, tool_choice)
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking)
 
@@ -3305,7 +4282,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`stream` must be a boolean.", "stream")
         message_id = "msg_" + uuid.uuid4().hex[:24]
 
-        def blocks_and_stop(text, stats):
+        def blocks_and_stop(text, stats, tool_reply=None):
             """Split a finished reply into Anthropic content blocks + stop_reason."""
             content = []
             reasoning = ""
@@ -3318,7 +4295,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                 "signature": ANTHROPIC_LOCAL_SIGNATURE})
             calls = []
             if tools:
-                text, calls = parse_arch_tool_calls(text, tools)
+                text, calls = parse_arch_tool_calls(text, tools, tool_reply)
             if text:
                 content.append({"type": "text", "text": text})
             for call in calls:
@@ -3338,11 +4315,20 @@ class APIHandler(BaseHTTPRequestHandler):
             if not stream:
                 output = []
                 stop_filter = StopFilter(stop_sequences, output.append, ignore_leading_stop)
+                sideband = ToolSideband(ARCH == "kimi" and bool(tools), stop_sequences,
+                                        ignore_leading_stop)
+
+                def generation_stopped():
+                    return stop_filter.stopped() or sideband.stopped()
+
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped)
+                    self.client_disconnected, grammar=grammar, stopped=generation_stopped,
+                    **({"on_tool": sideband.feed} if sideband.enabled else {}))
                 stop_filter.finish()
-                content, stop_reason = blocks_and_stop("".join(output), stats)
+                sideband.finish()
+                content, stop_reason = blocks_and_stop("".join(output), stats,
+                                                       sideband.reply())
                 self.send_json(200, {
                     "id": message_id, "type": "message", "role": "assistant",
                     "model": self.server.model_id, "content": content,
@@ -3406,6 +4392,8 @@ class APIHandler(BaseHTTPRequestHandler):
             ka_thread.start()
 
             raw = []
+            sideband = ToolSideband(ARCH == "kimi" and bool(tools), stop_sequences,
+                                    ignore_leading_stop)
             state = {"buf": "", "in_tool": False}
             hold = _tool_hold()
 
@@ -3421,6 +4409,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
             def emit_answer(chunk):
                 if not tools:
+                    emit_text(chunk)
+                    return
+                if sideband.seen:
                     emit_text(chunk)
                     return
                 if state["in_tool"]:
@@ -3456,18 +4447,27 @@ class APIHandler(BaseHTTPRequestHandler):
                                            emit_thinking if enable_thinking else None,
                                            close_thinking if enable_thinking else None)
             else:
+                # Anche qui: su GLM-5.3 il blocco e' aperto dal prompt, quindi
+                # lo splitter serve pure col ragionamento "spento", o il
+                # pensiero finisce incollato davanti alla risposta.
                 split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
-                         if enable_thinking else None)
+                         if starts_in_reasoning(enable_thinking) else None)
 
             def on_text(chunk):
                 raw.append(chunk)
                 (split.feed if split else emit_answer)(chunk)
 
             stop_filter = StopFilter(stop_sequences, on_text, ignore_leading_stop)
+
+            def generation_stopped():
+                return stop_filter.stopped() or sideband.stopped()
+
             stats = self.server.engine.generate(
                 prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                lambda: not connected[0], grammar=grammar, stopped=stop_filter.stopped)
+                lambda: not connected[0], grammar=grammar, stopped=generation_stopped,
+                **({"on_tool": sideband.feed} if sideband.enabled else {}))
             stop_filter.finish()
+            sideband.finish()
             if split:
                 split.close()
                 close_thinking()               # budget exhaustion before </think>
@@ -3479,7 +4479,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 send_event("content_block_stop", {"type": "content_block_stop",
                                                   "index": text_index})
 
-            content, stop_reason = blocks_and_stop("".join(raw), stats)
+            content, stop_reason = blocks_and_stop("".join(raw), stats,
+                                                   sideband.reply())
             index = text_index + 1 if stream_state["text_started"] else 1
             for block in content:
                 if block["type"] != "tool_use":

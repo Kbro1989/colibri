@@ -17,6 +17,7 @@ import {
   Link2,
   LoaderCircle,
   MemoryStick,
+  ImagePlus,
   MessageSquareText,
   MonitorDot,
   RefreshCw,
@@ -38,6 +39,7 @@ import { persistPublicSettings, stored } from "@/lib/storage"
 import { Markdown } from "@/components/Markdown"
 import { cn } from "@/lib/utils"
 import { useLocale } from "./i18n"
+import { REASONING_EFFORT, modelForcesReasoning, reasoningLevelsFor, type ReasoningLevel } from "@/lib/reasoning"
 
 const message = (role: ChatMessage["role"], content: string): ChatMessage => {
   let id: string
@@ -60,13 +62,36 @@ export default function App() {
   const [model, setModel] = useState(() => stored(localStorage, "colibri.model", "glm-5.2-colibri"))
   const [temperature, setTemperature] = useState(0.7)
   const [maxTokens, setMaxTokens] = useState(4096)
-  const [thinking, setThinking] = useState(false)
+  const [reasoning, setReasoning] = useState<ReasoningLevel>("off")
   const [cacheSlot, setCacheSlot] = useState(0)
   const [conversations, setConversations] = useState<Record<number, ChatMessage[]>>({ 0: [] })
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [healthError, setHealthError] = useState("")
   const [lastRun, setLastRun] = useState<StreamChatResult | null>(null)
   const [draft, setDraft] = useState("")
+  /* Immagini in attesa di partire col prossimo messaggio. Si tengono come
+     data: URI perche' e' quello che il server accetta e quello che il browser
+     puo' mostrare in anteprima senza inventarsi un percorso su disco. */
+  const [attachments, setAttachments] = useState<{ name: string; url: string }[]>([])
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const attachFiles = async (files: FileList | File[] | null) => {
+    if (!files) return
+    const images = Array.from(files).filter((file) => file.type.startsWith("image/"))
+    if (!images.length) return
+    const read = await Promise.all(
+      images.map(
+        (file) =>
+          new Promise<{ name: string; url: string }>((resolve, reject) => {
+            const reader = new FileReader()
+            reader.onload = () => resolve({ name: file.name, url: String(reader.result) })
+            reader.onerror = () => reject(reader.error)
+            reader.readAsDataURL(file)
+          }),
+      ),
+    )
+    setAttachments((current) => [...current, ...read])
+  }
   const [loading, setLoading] = useState(false)
   const [streamStart, setStreamStart] = useState<number | null>(null)
   const [tokenCount, setTokenCount] = useState(0)
@@ -136,6 +161,15 @@ export default function App() {
   // EFFECT #6
   useEffect(() => { setLastRun(null) }, [cacheSlot])
 
+  /* GLM 5.3 cannot turn reasoning off and has no distinct "medium" (it collapses
+     onto High). If the user switches to such a model while "off" or "medium" is
+     selected, lift it to a level the model actually honors instead of leaving the
+     control on a value it no longer offers. */
+  useEffect(() => {
+    if (modelForcesReasoning(model))
+      setReasoning((level) => (level === "off" || level === "medium" ? "high" : level))
+  }, [model])
+
   // EFFECT #7
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }) }, [messages])
 
@@ -183,11 +217,15 @@ export default function App() {
 
   const send = async () => {
     const content = draft.trim()
-    if (!content || loading) return
+    /* Un'immagine da sola e' una domanda valida: "questa cosa e'?" si puo'
+       chiedere anche senza scrivere niente. */
+    if ((!content && !attachments.length) || loading) return
     const user = message("user", content)
+    if (attachments.length) user.images = attachments.map((item) => item.url)
     const assistant = message("assistant", "")
     const history = [...messages, user]
     setDraft("")
+    setAttachments([])
     setError("")
     updateMessages([...history, assistant])
     setLoading(true)
@@ -208,7 +246,8 @@ export default function App() {
         messages: history,
         temperature,
         maxTokens,
-        enableThinking: thinking,
+        enableThinking: reasoning !== "off",
+        reasoningEffort: reasoning === "off" ? undefined : REASONING_EFFORT[reasoning],
         cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
         signal: controller.signal,
         /* Reasoning tokens are tokens: they count toward the rate, and the
@@ -321,9 +360,11 @@ export default function App() {
           </select><span className="field-help">{t("sidebar.kvSessionHelp")}</span></label> : null}
           <label><span className="label-line"><span>{t("sidebar.temperature")}</span><code>{temperature.toFixed(1)}</code></span><input className="range" type="range" min="0" max="2" step="0.1" value={temperature} onChange={(event) => setTemperature(Number(event.target.value))} /></label>
           <label>{t("sidebar.maxTokens")}<Input type="number" min={1} max={32768} value={maxTokens} onChange={(event) => { const value = Number(event.target.value); if (Number.isFinite(value)) setMaxTokens(Math.min(32768, Math.max(1, Math.round(value)))) }} /></label>
-          <button type="button" className={cn("toggle-row", thinking && "active")} aria-pressed={thinking} onClick={() => setThinking((value) => !value)}>
-            <span><BrainCircuit className="size-4" /> {t("sidebar.reasoning")}</span><i><b /></i>
-          </button>
+          <label><span className="label-line"><span><BrainCircuit className="size-4" /> {t("sidebar.reasoning")}</span></span>
+            <select value={reasoning} onChange={(event) => setReasoning(event.target.value as ReasoningLevel)} disabled={loading}>
+              {reasoningLevelsFor(model).map((level) => <option key={level} value={level}>{t(`sidebar.reasoning.${level}`)}</option>)}
+            </select>
+          </label>
         </section>
 
         <div className="sidebar-foot">
@@ -399,8 +440,22 @@ export default function App() {
         <div className="composer-wrap">
           {error && <div className="error-banner" role="alert">{t(error)}</div>}
           <div className="composer">
-            <Textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={t("chat.placeholder")} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send() } }} />
-            <div className="composer-foot"><span><MessageSquareText className="size-3.5" /> {t("chat.inputHint")}</span>{loading ? <Button variant="destructive" size="icon" aria-label={t("chat.stop")} onClick={() => abortRef.current?.abort()}><CircleStop className="size-4" /></Button> : <Button size="icon" aria-label={t("chat.send")} disabled={!canSend} onClick={() => void send()}><ArrowUp className="size-4" /></Button>}</div>
+            <Textarea value={draft}
+              onPaste={(event) => { const files = Array.from(event.clipboardData.files); if (files.length) { event.preventDefault(); void attachFiles(files) } }}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => { if (event.dataTransfer.files.length) { event.preventDefault(); void attachFiles(event.dataTransfer.files) } }} onChange={(event) => setDraft(event.target.value)} placeholder={t("chat.placeholder")} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send() } }} />
+            {attachments.length > 0 && (
+              <div className="attachments">
+                {attachments.map((item, index) => (
+                  <span key={item.url + index} className="attachment">
+                    <img src={item.url} alt={item.name} />
+                    <button type="button" aria-label={t("chat.removeImage")}
+                      onClick={() => setAttachments((current) => current.filter((_, at) => at !== index))}>x</button>
+                  </span>
+                ))}
+              </div>
+            )}
+            <div className="composer-foot"><span><MessageSquareText className="size-3.5" /> {t("chat.inputHint")}</span><input ref={fileInputRef} type="file" accept="image/*" multiple hidden onChange={(event) => { void attachFiles(event.target.files); event.target.value = "" }} /><Button variant="ghost" size="icon" aria-label={t("chat.attachImage")} onClick={() => fileInputRef.current?.click()}><ImagePlus className="size-4" /></Button>{loading ? <Button variant="destructive" size="icon" aria-label={t("chat.stop")} onClick={() => abortRef.current?.abort()}><CircleStop className="size-4" /></Button> : <Button size="icon" aria-label={t("chat.send")} disabled={!canSend} onClick={() => void send()}><ArrowUp className="size-4" /></Button>}</div>
           </div>
         </div>
         </>}

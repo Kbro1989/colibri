@@ -41,6 +41,11 @@ const it: Record<string, string> = {
   "sidebar.temperature": "Temperatura",
   "sidebar.maxTokens": "Token di output massimi",
   "sidebar.reasoning": "Ragionamento",
+  "sidebar.reasoning.off": "Off",
+  "sidebar.reasoning.low": "Basso",
+  "sidebar.reasoning.medium": "Medio",
+  "sidebar.reasoning.high": "Alto",
+  "sidebar.reasoning.max": "Max",
   "sidebar.transport": "Trasporto compatibile OpenAI",
 
   "topbar.activeModel": "MODELLO ATTIVO",
@@ -63,6 +68,8 @@ const it: Record<string, string> = {
   "chat.colibri": "colibrì",
   "chat.placeholder": "Scrivi a colibrì…",
   "chat.inputHint": "Invio per inviare · Shift+Invio per andare a capo",
+  "chat.attachImage": "Allega un'immagine",
+  "chat.removeImage": "Togli l'immagine",
   "chat.stop": "Ferma la generazione",
   "chat.send": "Invia messaggio",
 
